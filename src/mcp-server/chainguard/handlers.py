@@ -1,0 +1,2883 @@
+"""
+CHAINGUARD MCP Server - Tool Handlers Module
+
+Handler-Registry Pattern for testability and maintainability.
+Each handler is a separate function decorated with @handler.register().
+
+Copyright (c) 2026 Provimedia GmbH
+Licensed under the Polyform Noncommercial License 1.0.0
+See LICENSE file in the project root for full license information.
+"""
+
+import asyncio
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Any, List, Callable, Awaitable
+
+try:
+    from mcp.types import TextContent
+except ImportError:
+    TextContent = None
+
+from .config import (
+    CONFIG, CONTEXT_MARKER, CONTEXT_REFRESH_TEXT,
+    MAX_DESCRIPTION_LENGTH, MAX_OUT_OF_SCOPE_FILES,
+    MAX_CHANGED_FILES, MAX_BATCH_FILES, DESCRIPTION_PREVIEW_LENGTH,
+    SCOPE_REQUIRED_TOOLS, SCOPE_BLOCKED_TEXT,
+    TaskMode, detect_task_mode, get_mode_context, get_mode_features,
+    should_validate_syntax,
+    logger
+)
+from .models import ScopeDefinition
+from .project_manager import project_manager as pm
+from .validators import SyntaxValidator
+from .utils import sanitize_path, is_path_safe
+from .checklist import ChecklistRunner
+from .analyzers import CodeAnalyzer, ImpactAnalyzer
+from .http_session import http_session_manager
+from .test_runner import TestRunner, TestConfig, TestResult
+from .history import HistoryManager, format_auto_suggest
+from .db_inspector import DBInspector, DBConfig, get_inspector, clear_inspector
+
+# Memory imports (v5.1 - Long-Term Memory)
+try:
+    from .memory import (
+        memory_manager, context_injector, get_project_id,
+        RelevanceScorer, ContextFormatter, should_index_file
+    )
+    from .embeddings import KeywordExtractor, detect_task_type
+    MEMORY_AVAILABLE = True
+except ImportError:
+    MEMORY_AVAILABLE = False
+
+# Code Summarizer imports (v5.4 - Deep Logic Summaries)
+try:
+    from .code_summarizer import code_summarizer
+    SUMMARIZER_AVAILABLE = True
+except ImportError:
+    code_summarizer = None
+    SUMMARIZER_AVAILABLE = False
+
+
+# =============================================================================
+# Handler Registry
+# =============================================================================
+HandlerFunc = Callable[[Dict[str, Any]], Awaitable[List[TextContent]]]
+
+
+class HandlerRegistry:
+    """
+    Registry for tool handlers with decorator-based registration.
+
+    Usage:
+        @handler.register("tool_name")
+        async def handle_tool(args: Dict[str, Any]) -> List[TextContent]:
+            ...
+    """
+    _handlers: Dict[str, HandlerFunc] = {}
+
+    @classmethod
+    def register(cls, name: str):
+        """Decorator to register a handler function."""
+        def decorator(func: HandlerFunc) -> HandlerFunc:
+            cls._handlers[name] = func
+            return func
+        return decorator
+
+    @classmethod
+    async def dispatch(cls, name: str, args: Dict[str, Any]) -> List[TextContent]:
+        """Dispatch a tool call to its registered handler."""
+        # v4.9: Scope-Blockade - Tools ohne Scope blockieren
+        if name not in SCOPE_REQUIRED_TOOLS:
+            working_dir = args.get("working_dir")
+            state = await pm.get_async(working_dir)
+            if not state.scope:
+                logger.warning(f"BLOCKED: {name} called without scope")
+                return [TextContent(type="text", text=SCOPE_BLOCKED_TEXT)]
+
+        handler = cls._handlers.get(name)
+        if handler:
+            try:
+                return await handler(args)
+            except Exception as e:
+                logger.error(f"Error in {name}: {e}")
+                return [TextContent(type="text", text=f"Error: {str(e)[:50]}")]
+        return [TextContent(type="text", text=f"Unknown: {name}")]
+
+    @classmethod
+    def list_handlers(cls) -> List[str]:
+        """List all registered handler names."""
+        return list(cls._handlers.keys())
+
+
+# Shorthand for decorator
+handler = HandlerRegistry
+
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+def _text(msg: str) -> List[TextContent]:
+    """Create a single TextContent response."""
+    return [TextContent(type="text", text=msg)]
+
+
+def _check_context(args: Dict[str, Any]) -> str:
+    """Check for context marker and return refresh text if missing."""
+    ctx = args.get("ctx", "")
+    return "" if ctx == CONTEXT_MARKER else CONTEXT_REFRESH_TEXT
+
+
+# =============================================================================
+# CORE HANDLERS
+# =============================================================================
+
+@handler.register("chainguard_set_scope")
+async def handle_set_scope(args: Dict[str, Any]) -> List[TextContent]:
+    """Define task scope at start with Task Mode support."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    description = args["description"]
+
+    # v5.0: Task Mode - explicit or auto-detected
+    explicit_mode = args.get("mode")
+    if explicit_mode:
+        task_mode = TaskMode.from_string(explicit_mode)
+        mode_source = "explicit"
+    else:
+        task_mode = detect_task_mode(description, state.project_path)
+        mode_source = "auto-detected"
+
+    state.scope = ScopeDefinition(
+        description=description,
+        modules=args.get("modules", []),
+        acceptance_criteria=args.get("acceptance_criteria", []),
+        checklist=args.get("checklist", []),
+        created_at=datetime.now().isoformat()
+    )
+
+    # v5.0: Set task mode
+    state.task_mode = str(task_mode)
+
+    # v4.16: FULL STATE RESET - alle scope-relevanten Felder zurücksetzen!
+    state.phase = "planning"
+    state.files_since_validation = 0
+    state.files_changed = 0
+    state.out_of_scope_files = []
+    state.changed_files = []
+    state.db_schema_checked_at = ""  # v4.18: Timestamp statt Boolean
+    state.http_tests_performed = 0
+    state.http_base_url = ""
+    state.http_credentials = {}
+    state.impact_check_pending = False
+    state.criteria_status = {}
+    state.checklist_results = {}
+    state.alerts = []
+    state.recent_actions = []
+
+    # v5.0: Reset mode-specific fields
+    state.word_count_total = 0
+    state.chapter_status = {}
+    state.command_history = []
+    state.checkpoints = []
+    state.sources = []
+    state.facts = []
+
+    state.add_action(f"SCOPE[{task_mode}]: {description[:25]}")
+    await pm.save_async(state)
+
+    # v4.19: Create .chainguard marker in project directory for Enforcer Hook
+    marker_dir = Path(state.project_path) / ".chainguard"
+    try:
+        marker_dir.mkdir(parents=True, exist_ok=True)
+        marker_file = marker_dir / "marker"
+        if not marker_file.exists():
+            marker_file.write_text(f"# Chainguard Project Marker\n# Created: {datetime.now().isoformat()}\n# Mode: {task_mode}\n")
+    except (OSError, PermissionError):
+        pass  # Silently ignore if we can't create the marker
+
+    criteria_count = len(state.scope.acceptance_criteria)
+    checklist_count = len(state.scope.checklist)
+    modules_str = ", ".join(state.scope.modules[:3]) or "all"
+    desc_preview = description[:50] + "..." if len(description) > 50 else description
+
+    # v5.0: Mode indicator emoji
+    mode_emoji = {
+        TaskMode.PROGRAMMING: "💻",
+        TaskMode.CONTENT: "📝",
+        TaskMode.DEVOPS: "🖥️",
+        TaskMode.RESEARCH: "🔬",
+        TaskMode.GENERIC: "⚡"
+    }.get(task_mode, "📋")
+
+    lines = [f"✓ Scope: {desc_preview}"]
+    lines.append(f"{mode_emoji} **Mode: {task_mode}** ({mode_source})")
+    lines.append(f"Modules: {modules_str} | Criteria: {criteria_count} | Checks: {checklist_count}")
+
+    if len(description) > MAX_DESCRIPTION_LENGTH:
+        lines.append("")
+        lines.append(f"⚠ Description lang ({len(description)} > {MAX_DESCRIPTION_LENGTH})")
+        lines.append("→ Tipp: Kurze Description + Details als acceptance_criteria")
+
+    # v5.0: Mode-specific context injection
+    context_text = get_mode_context(task_mode)
+    lines.append(context_text)
+
+    # v5.0: Hint if mode was auto-detected
+    if mode_source == "auto-detected":
+        lines.append("")
+        lines.append(f"💡 Modus wurde automatisch erkannt. Falls falsch:")
+        lines.append(f'   `chainguard_set_scope(description="...", mode="programming|content|devops|research")`')
+
+    # v5.1/v5.2: Smart Context Injection from Long-Term Memory
+    if MEMORY_AVAILABLE:
+        try:
+            project_id = get_project_id(state.project_path)
+
+            # Get semantic context
+            context_text = await context_injector.get_context(
+                project_id=project_id,
+                description=description,
+                max_results=8
+            )
+            if context_text:
+                lines.append(context_text)
+
+            # v5.2: Add proactive hints from learnings
+            if await memory_manager.memory_exists(project_id):
+                memory = await memory_manager.get_memory(project_id)
+
+                # Query learnings collection for related insights
+                keywords = KeywordExtractor.extract(description)
+                if keywords:
+                    learning_results = await memory.query(
+                        query_text=" ".join(keywords),
+                        collection="learnings",
+                        n_results=2
+                    )
+
+                    if learning_results:
+                        hint_lines = []
+                        for doc, distance in learning_results:
+                            if distance < 0.8:  # Only show relevant learnings
+                                scope = doc.metadata.get("scope", "")
+                                if scope and scope != description:  # Don't show same session
+                                    hint_lines.append(f"• {scope[:50]}")
+
+                        if hint_lines:
+                            lines.append("")
+                            lines.append("💡 **Ähnliche frühere Tasks:**")
+                            for hint in hint_lines[:2]:
+                                lines.append(hint)
+
+        except Exception as e:
+            logger.warning(f"Smart Context Injection failed: {e}")
+
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_track")
+async def handle_track(args: Dict[str, Any]) -> List[TextContent]:
+    """Track file change with mode-aware auto-validation and Error Memory."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    file = args.get("file", "")
+    action = args.get("action", "edit")
+    skip_validation = args.get("skip_validation", False)
+
+    if file and not is_path_safe(file, state.project_path):
+        return _text("⚠ Invalid path")
+
+    # v5.0: Get task mode and features
+    task_mode = state.get_task_mode()
+    features = state.get_features()
+
+    state.files_changed += 1
+    state.files_since_validation += 1
+    state.last_activity = datetime.now().isoformat()
+
+    if file:
+        state.add_changed_file(Path(file).name)
+
+    messages = []
+
+    # v5.0: Only check schema files in programming mode
+    is_schema_file = state.is_schema_file(file) if file else False
+
+    if features.db_inspection and is_schema_file:
+        # v4.18: Invalidate schema check when .sql files are modified
+        if state.db_schema_checked_at:
+            was_invalidated = state.invalidate_schema_check()
+            if was_invalidated:
+                messages.append("🔄 **SCHEMA INVALIDIERT**")
+                messages.append("   Schema-Datei geändert → DB-Schema muss neu geprüft werden.")
+                messages.append("   → Nutze: chainguard_db_schema(refresh=True) vor weiteren Änderungen")
+                messages.append("")
+
+        # v4.14/v4.18: Warn if editing schema/migration files without valid schema check
+        if not state.is_schema_checked():
+            schema_age = state.get_schema_check_age()
+            if schema_age == -1:
+                messages.append("⚠️ **DB-SCHEMA NICHT GEPRÜFT!**")
+                messages.append("   Du bearbeitest Schema-Dateien ohne vorherige DB-Inspektion.")
+            else:
+                messages.append(f"⚠️ **DB-SCHEMA VERALTET!** (Check vor {schema_age}s, TTL: 600s)")
+                messages.append("   Schema-Check ist abgelaufen.")
+            messages.append("   → Nutze: chainguard_db_connect() + chainguard_db_schema()")
+            messages.append("   → Verhindert Spalten-Fehler wie 'Unknown column'")
+            messages.append("")
+
+    validation_result = "PASS"
+    error_type = ""
+    error_msg = ""
+
+    # v5.0: Syntax Validation - only if mode enables it for this file type
+    run_validation = (
+        file and
+        not skip_validation and
+        action != "delete" and
+        should_validate_syntax(task_mode, file)
+    )
+
+    if run_validation:
+        validation = await SyntaxValidator.validate_file(file, state.project_path)
+        if not validation["valid"]:
+            for err in validation["errors"]:
+                messages.append(f"✗ {err['type']}: {err['message']}")
+                error_type = err['type']
+                error_msg = err['message']
+                validation_result = f"FAIL:{err['type']}:{err['message'][:50]}"
+
+            state.alerts.append({
+                "msg": f"Syntax error in {Path(file).name}",
+                "errors": validation["errors"],
+                "ack": False,
+                "ts": datetime.now().isoformat()
+            })
+
+            # v4.11: Index error for future recall
+            scope_desc = state.scope.description if state.scope else ""
+            await HistoryManager.index_error(
+                project_id=state.project_id,
+                file=file,
+                error_type=error_type,
+                error_msg=error_msg,
+                scope_desc=scope_desc
+            )
+
+            # v4.11: Auto-Suggest - find similar errors with known fixes
+            similar = await HistoryManager.find_similar_errors(
+                project_id=state.project_id,
+                file=file,
+                error_type=error_type,
+                error_msg=error_msg
+            )
+            if similar:
+                messages.append(format_auto_suggest(similar))
+
+    # Check scope
+    sanitized = sanitize_path(file, state.project_path) if file else ""
+    if sanitized and not state.check_file_in_scope(sanitized):
+        state.add_out_of_scope_file(sanitized)
+        messages.append(f"⚠ OOS: {Path(sanitized).name}")
+
+    state.add_action(f"{action}: {Path(file).name if file else '?'}")
+    await pm.save_async(state)
+
+    # v4.11: Log change to history
+    if file:
+        scope_id = state.scope.created_at if state.scope else ""
+        scope_desc = state.scope.description if state.scope else ""
+        await HistoryManager.log_change(
+            project_id=state.project_id,
+            file=sanitized or file,
+            action=action,
+            validation_result=validation_result,
+            scope_id=scope_id,
+            scope_desc=scope_desc
+        )
+
+    # v5.2: Auto-update memory when file is tracked (non-blocking)
+    if MEMORY_AVAILABLE and file:
+        try:
+            project_id = get_project_id(state.project_path)
+            if await memory_manager.memory_exists(project_id):
+                if action == "delete":
+                    # v5.3: Remove deleted files from memory
+                    asyncio.create_task(_delete_from_memory(
+                        project_id=project_id,
+                        file_path=file,
+                        project_path=state.project_path
+                    ))
+                else:
+                    # Fire-and-forget: update memory in background
+                    asyncio.create_task(_update_memory_for_file(
+                        project_id=project_id,
+                        file_path=file,
+                        project_path=state.project_path
+                    ))
+        except Exception as e:
+            logger.debug(f"Memory auto-update skipped: {e}")
+
+    context_refresh = _check_context(args)
+
+    if messages:
+        return _text("\n".join(messages) + context_refresh)
+
+    if state.needs_validation():
+        return _text(f"→ {state.files_since_validation} changes, validate soon{context_refresh}")
+
+    return _text(context_refresh.strip())
+
+
+@handler.register("chainguard_track_batch")
+async def handle_track_batch(args: Dict[str, Any]) -> List[TextContent]:
+    """Track multiple files at once."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    files = args.get("files", [])
+    action = args.get("action", "edit")
+    skip_validation = args.get("skip_validation", False)
+
+    if not files:
+        return _text("⚠ No files provided")
+
+    files = files[:MAX_BATCH_FILES]
+    errors = []
+    tracked = 0
+    oos_count = 0
+
+    # v4.18: Check for schema files in batch and handle invalidation
+    schema_files_in_batch = [f for f in files if f and state.is_schema_file(f)]
+
+    if schema_files_in_batch:
+        # Invalidate schema check if any schema file is in batch
+        if state.db_schema_checked_at:
+            state.invalidate_schema_check()
+            errors.append("🔄 **SCHEMA INVALIDIERT**")
+            errors.append(f"   {len(schema_files_in_batch)} Schema-Datei(en) geändert")
+            errors.append("   → Nutze: chainguard_db_schema(refresh=True)")
+            errors.append("")
+
+        # Warn if schema not checked
+        if not state.is_schema_checked():
+            schema_age = state.get_schema_check_age()
+            if schema_age == -1:
+                errors.append("⚠️ **DB-SCHEMA NICHT GEPRÜFT!**")
+            else:
+                errors.append(f"⚠️ **DB-SCHEMA VERALTET!** (Check vor {schema_age}s)")
+            errors.append("   Du bearbeitest Schema-Dateien ohne gültige DB-Inspektion.")
+            errors.append("   → Nutze: chainguard_db_connect() + chainguard_db_schema()")
+            errors.append("")
+
+    for file in files:
+        if file and not is_path_safe(file, state.project_path):
+            errors.append(f"⚠ Invalid path: {Path(file).name}")
+            continue
+
+        state.files_changed += 1
+        state.files_since_validation += 1
+
+        if file:
+            state.add_changed_file(Path(file).name)
+
+        if file and not skip_validation and action != "delete":
+            validation = await SyntaxValidator.validate_file(file, state.project_path)
+            if not validation["valid"]:
+                for err in validation["errors"]:
+                    errors.append(f"✗ {Path(file).name}: {err['type']} - {err['message'][:40]}")
+                state.alerts.append({
+                    "msg": f"Syntax error in {Path(file).name}",
+                    "errors": validation["errors"],
+                    "ack": False,
+                    "ts": datetime.now().isoformat()
+                })
+            else:
+                tracked += 1
+
+        sanitized = sanitize_path(file, state.project_path) if file else ""
+        if sanitized and not state.check_file_in_scope(sanitized):
+            state.add_out_of_scope_file(sanitized)
+            oos_count += 1
+
+    state.last_activity = datetime.now().isoformat()
+    # v4.16: Dateinamen in Action speichern für HTTP-Test Fallback
+    file_names = [Path(f).name for f in files if f][:3]
+    file_names_str = ", ".join(file_names)
+    if len(files) > 3:
+        file_names_str += f" +{len(files)-3}"
+    state.add_action(f"BATCH: {action} [{file_names_str}]")
+    await pm.save_async(state, immediate=True)  # v4.16: immediate für Konsistenz
+
+    parts = []
+    if tracked > 0 or (skip_validation and len(files) > 0):
+        actual_tracked = len(files) if skip_validation else tracked
+        parts.append(f"✓ {actual_tracked}/{len(files)} files tracked")
+
+    if errors:
+        parts.append("\n".join(errors[:5]))
+        if len(errors) > 5:
+            parts.append(f"... +{len(errors) - 5} more errors")
+
+    if oos_count > 0:
+        parts.append(f"⚠ {oos_count} files out of scope")
+
+    if state.needs_validation():
+        parts.append(f"→ {state.files_since_validation} changes, validate soon")
+
+    return _text("\n".join(parts) if parts else "")
+
+
+@handler.register("chainguard_status")
+async def handle_status(args: Dict[str, Any]) -> List[TextContent]:
+    """Ultra-compact one-line status."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    status_line = state.get_status_line()
+
+    context_refresh = _check_context(args)
+    if context_refresh:
+        return _text(f"{status_line}{context_refresh}")
+    return _text(status_line)
+
+
+@handler.register("chainguard_context")
+async def handle_context(args: Dict[str, Any]) -> List[TextContent]:
+    """Full context - use sparingly."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+
+    lines = [f"## {state.project_name} [{state.phase}]"]
+
+    warnings = []
+    if not state.scope:
+        warnings.append("NO SCOPE DEFINED")
+    if state.needs_validation():
+        warnings.append(f"{state.files_since_validation} changes need validation")
+    if state.out_of_scope_files:
+        warnings.append(f"OOS files: {', '.join(Path(f).name for f in state.out_of_scope_files[-3:])}")
+
+    open_alerts = [a for a in state.alerts if not a.get("ack")]
+    if open_alerts:
+        warnings.append(f"Alerts: {', '.join(a['msg'][:20] for a in open_alerts[-2:])}")
+
+    if warnings:
+        lines.append(f"**⚠ {' | '.join(warnings)}**")
+
+    if state.scope:
+        desc = state.scope.description
+        if len(desc) > DESCRIPTION_PREVIEW_LENGTH:
+            desc_preview = desc[:DESCRIPTION_PREVIEW_LENGTH] + f"... ({len(desc)} chars)"
+        else:
+            desc_preview = desc
+        lines.append(f"\n**Scope:** {desc_preview}")
+        if state.scope.modules:
+            lines.append(f"Modules: {', '.join(state.scope.modules[:5])}")
+
+    lines.append(f"\n**Stats:** {state.files_changed} files | {state.files_since_validation} since val | V:{state.validations_passed}✓/{state.validations_failed}✗")
+
+    if state.scope and state.scope.acceptance_criteria:
+        done = sum(1 for c in state.scope.acceptance_criteria if state.criteria_status.get(c))
+        total = len(state.scope.acceptance_criteria)
+        lines.append(f"**Criteria:** {done}/{total}")
+
+    if state.recent_actions:
+        lines.append(f"\n**Recent:** {' → '.join(state.recent_actions[-3:])}")
+
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_set_phase")
+async def handle_set_phase(args: Dict[str, Any]) -> List[TextContent]:
+    """Set project phase."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    new_phase = args["phase"]
+    state.current_task = args.get("task", "")
+
+    if new_phase == "done":
+        completion = state.get_completion_status()
+        if not completion["complete"]:
+            warnings = [f"⚠ {i['message']}" for i in completion["issues"]]
+            state.phase = new_phase
+            state.add_action("PHASE: done (warnings)")
+            await pm.save_async(state)
+            return _text(f"→ done (mit Warnungen)\n" + "\n".join(warnings) +
+                        "\n\n→ Nutze `chainguard_finish` für sauberen Abschluss")
+
+    state.phase = new_phase
+    state.add_action(f"PHASE: {state.phase}")
+    await pm.save_async(state)
+
+    task_str = f": {state.current_task}" if state.current_task else ""
+    return _text(f"→ {state.phase}{task_str}")
+
+
+# =============================================================================
+# VALIDATION HANDLERS
+# =============================================================================
+
+@handler.register("chainguard_run_checklist")
+async def handle_run_checklist(args: Dict[str, Any]) -> List[TextContent]:
+    """Execute all checklist checks."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+
+    if not state.scope or not state.scope.checklist:
+        return _text("No checklist defined")
+
+    # Use async version for better performance
+    results = await ChecklistRunner.run_all_async(state.scope.checklist, state.project_path)
+    state.checklist_results = results["results"]
+    state.add_action(f"CHECK: {results['passed']}/{results['total']}")
+    await pm.save_async(state)
+
+    result_str = " ".join(f"{k}:{v}" for k, v in results["results"].items())
+    return _text(f"Checklist {results['passed']}/{results['total']}: {result_str}")
+
+
+@handler.register("chainguard_check_criteria")
+async def handle_check_criteria(args: Dict[str, Any]) -> List[TextContent]:
+    """Mark or view acceptance criteria."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+
+    if args.get("criterion") is not None and args.get("fulfilled") is not None:
+        state.criteria_status[args["criterion"]] = args["fulfilled"]
+        await pm.save_async(state)
+        icon = '✓' if args['fulfilled'] else '✗'
+        return _text(f"{icon} {args['criterion'][:40]}")
+
+    if not state.scope or not state.scope.acceptance_criteria:
+        return _text("No criteria defined")
+
+    lines = []
+    for c in state.scope.acceptance_criteria:
+        status = state.criteria_status.get(c)
+        icon = "✓" if status is True else "✗" if status is False else "?"
+        lines.append(f"{icon} {c}")
+
+    done = sum(1 for c in state.scope.acceptance_criteria if state.criteria_status.get(c))
+    return _text(f"Criteria {done}/{len(state.scope.acceptance_criteria)}:\n" + "\n".join(lines))
+
+
+@handler.register("chainguard_validate")
+async def handle_validate(args: Dict[str, Any]) -> List[TextContent]:
+    """Record validation result."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    status = args["status"]
+    note = args.get("note", "")
+
+    if status == "PASS":
+        state.validations_passed += 1
+        completion = state.get_completion_status()
+        if not completion["complete"]:
+            warnings = [f"⚠ {i['message']}" for i in completion["issues"]]
+            state.files_since_validation = 0
+            state.last_validation = datetime.now().isoformat()
+            state.add_action("VAL: PASS (warnings)")
+            await pm.save_async(state, immediate=True)
+            return _text(f"Validation: PASS" + (f" - {note}" if note else "") +
+                        f"\n\n⚠ Offene Punkte:\n" + "\n".join(warnings) +
+                        "\n\n→ Nutze `chainguard_finish` für vollständigen Abschluss")
+    else:
+        state.validations_failed += 1
+        state.alerts.append({
+            "msg": note or "Validation failed",
+            "ack": False,
+            "ts": datetime.now().isoformat()
+        })
+
+    state.files_since_validation = 0
+    state.last_validation = datetime.now().isoformat()
+    state.add_action(f"VAL: {status}")
+    await pm.save_async(state, immediate=True)
+
+    return _text(f"Validation: {status}" + (f" - {note}" if note else ""))
+
+
+# =============================================================================
+# ALERT HANDLERS
+# =============================================================================
+
+@handler.register("chainguard_alert")
+async def handle_alert(args: Dict[str, Any]) -> List[TextContent]:
+    """Add an alert."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    state.alerts.append({
+        "msg": args["message"],
+        "ack": False,
+        "ts": datetime.now().isoformat()
+    })
+    await pm.save_async(state)
+    return _text(f"⚠ {args['message'][:50]}")
+
+
+@handler.register("chainguard_clear_alerts")
+async def handle_clear_alerts(args: Dict[str, Any]) -> List[TextContent]:
+    """Acknowledge all alerts."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    count = sum(1 for a in state.alerts if not a.get("ack"))
+    for a in state.alerts:
+        a["ack"] = True
+    await pm.save_async(state)
+    return _text(f"✓ {count} alerts cleared")
+
+
+# =============================================================================
+# ADMIN HANDLERS
+# =============================================================================
+
+@handler.register("chainguard_projects")
+async def handle_projects(args: Dict[str, Any]) -> List[TextContent]:
+    """List all tracked projects."""
+    projects = await pm.list_all_projects_async()
+    if not projects:
+        return _text("No projects")
+    lines = [f"{p['name']}|{p['phase']}|{p['last']}" for p in projects[:10]]
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_config")
+async def handle_config(args: Dict[str, Any]) -> List[TextContent]:
+    """View or set config."""
+    if args.get("validation_threshold"):
+        CONFIG.validation_reminder_threshold = args["validation_threshold"]
+        CONFIG.save()
+    return _text(f"Config: val_threshold={CONFIG.validation_reminder_threshold}")
+
+
+# =============================================================================
+# HTTP TESTING HANDLERS
+# =============================================================================
+
+@handler.register("chainguard_test_endpoint")
+async def handle_test_endpoint(args: Dict[str, Any]) -> List[TextContent]:
+    """Test HTTP endpoint with session support and auto-re-login."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    url = args["url"]
+    method = args.get("method", "GET")
+    data = args.get("data")
+    headers = args.get("headers")
+
+    if not url.startswith("http"):
+        if state.http_base_url:
+            url = state.http_base_url.rstrip("/") + "/" + url.lstrip("/")
+        else:
+            return _text("⚠ Set base_url first: chainguard_set_base_url")
+
+    # v4.15: Auto-re-login if session was lost but credentials are stored
+    relogin_msg = ""
+    session_check = await http_session_manager.ensure_session(
+        project_id=state.project_id,
+        base_url=state.http_base_url
+    )
+    if session_check.get("auto_relogin"):
+        relogin_msg = "🔄 Auto-Re-Login erfolgreich\n"
+
+    result = await http_session_manager.test_endpoint(
+        url=url, method=method, project_id=state.project_id,
+        data=data, headers=headers
+    )
+
+    # v4.13: Track HTTP tests for finish warning
+    state.http_tests_performed += 1
+    state.add_action(f"HTTP {method}: {result['status_code']}")
+    await pm.save_async(state)
+
+    if result["needs_auth"]:
+        return _text(f"🔐 Auth required ({result['status_code']}): {result['error']}\n→ Use chainguard_login to authenticate")
+
+    if result["success"]:
+        preview = result["body_preview"][:200] if result["body_preview"] else ""
+        return _text(f"{relogin_msg}✓ {method} {result['status_code']}\n{preview}")
+
+    return _text(f"{relogin_msg}✗ {method} {result['status_code']}: {result.get('error', 'Failed')}\n{result['body_preview'][:200]}")
+
+
+@handler.register("chainguard_login")
+async def handle_login(args: Dict[str, Any]) -> List[TextContent]:
+    """Login to application and store session."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    login_url = args["login_url"]
+    username = args["username"]
+    password = args["password"]
+    username_field = args.get("username_field", "email")
+    password_field = args.get("password_field", "password")
+
+    if not login_url.startswith("http") and state.http_base_url:
+        login_url = state.http_base_url.rstrip("/") + "/" + login_url.lstrip("/")
+
+    result = await http_session_manager.login(
+        login_url=login_url, username=username, password=password,
+        project_id=state.project_id, username_field=username_field,
+        password_field=password_field
+    )
+
+    if result["success"]:
+        state.http_credentials = {"username": username, "login_url": login_url}
+        state.add_action("LOGIN: success")
+        await pm.save_async(state)
+        return _text(f"✓ Logged in as {username}\nSession stored for future requests")
+
+    state.add_action("LOGIN: failed")
+
+    # v4.16: BLOCKING Alert - finish() kann nicht umgangen werden bis Credentials geklärt
+    state.alerts.append({
+        "msg": "⛔ LOGIN_REQUIRED: Credentials via AskUserQuestion klären",
+        "type": "login_required",
+        "blocking": True,  # Kann nicht mit force=true umgangen werden!
+        "ack": False,
+        "ts": datetime.now().isoformat()
+    })
+
+    await pm.save_async(state)
+    return _text(
+        f"✗ Login failed: {result.get('error', 'Unknown error')}\n\n"
+        "⛔ BLOCKIERT: Nutze AskUserQuestion für korrekte Credentials:\n"
+        "   - Login URL (if different)\n"
+        "   - Username/Email\n"
+        "   - Password\n"
+        "   - Username field name (default: 'email')\n"
+        "   - Password field name (default: 'password')\n"
+        "Dann chainguard_login() erneut aufrufen.\n\n"
+        "⚠️ finish() ist blockiert bis Login erfolgreich oder Alert cleared!"
+    )
+
+
+@handler.register("chainguard_set_base_url")
+async def handle_set_base_url(args: Dict[str, Any]) -> List[TextContent]:
+    """Set base URL for HTTP tests."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    base_url = args["base_url"].rstrip("/")
+    state.http_base_url = base_url
+    state.add_action(f"BASE_URL: {base_url[:30]}")
+    await pm.save_async(state)
+    return _text(f"✓ Base URL: {base_url}")
+
+
+@handler.register("chainguard_clear_session")
+async def handle_clear_session(args: Dict[str, Any]) -> List[TextContent]:
+    """Clear stored session/cookies and base URL."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    http_session_manager.clear_session(state.project_id)
+    state.http_credentials = {}
+    state.http_base_url = ""  # v4.15.1: Also clear base URL
+    state.add_action("SESSION: cleared")
+    await pm.save_async(state)
+    return _text("✓ Session + Base-URL cleared")
+
+
+# =============================================================================
+# ANALYSIS HANDLERS
+# =============================================================================
+
+@handler.register("chainguard_analyze")
+async def handle_analyze(args: Dict[str, Any]) -> List[TextContent]:
+    """Pre-flight code analysis."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    target = args.get("target", "")
+
+    if not target:
+        return _text("❌ target parameter required")
+
+    result = await CodeAnalyzer.analyze_file(target, state.project_path)
+    output = CodeAnalyzer.format_output(result)
+    state.add_action(f"ANALYZE: {Path(target).name}")
+    await pm.save_async(state)
+
+    return _text(output)
+
+
+@handler.register("chainguard_finish")
+async def handle_finish(args: Dict[str, Any]) -> List[TextContent]:
+    """Complete task with full validation."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    force = args.get("force", False)
+    confirmed = args.get("confirmed", False)
+
+    # Run checklist if not done yet
+    if state.scope and state.scope.checklist and not state.checklist_results:
+        results = await ChecklistRunner.run_all_async(state.scope.checklist, state.project_path)
+        state.checklist_results = results["results"]
+
+    completion = state.get_completion_status()
+
+    lines = []
+    scope_desc = state.scope.description if state.scope else "Kein Scope definiert"
+    lines.append(f"## Task-Abschluss: {scope_desc}")
+    lines.append("")
+    lines.append(f"**Kriterien:** {completion['criteria_done']}/{completion['criteria_total']}")
+
+    if state.checklist_results:
+        passed = sum(1 for v in state.checklist_results.values() if v == "✓")
+        total = len(state.checklist_results)
+        lines.append(f"**Checklist:** {passed}/{total}")
+
+    # v4.15: Check for blocking issues (like missing HTTP tests)
+    blocking_issues = [i for i in completion["issues"] if i.get("blocking")]
+
+    if completion["issues"]:
+        lines.append("")
+        lines.append("**Offene Punkte:**")
+        for issue in completion["issues"]:
+            details = ""
+            if "details" in issue and issue["details"]:
+                details = f" ({', '.join(str(d)[:20] for d in issue['details'][:2])})"
+
+            # v4.15: Mark blocking issues clearly
+            prefix = "🚫" if issue.get("blocking") else "-"
+            lines.append(f"{prefix} {issue['message']}{details}")
+
+            # v4.15: Add hint for HTTP test issues
+            if issue.get("type") == "http_test":
+                lines.append("  → Nutze: chainguard_set_base_url + chainguard_test_endpoint")
+                lines.append("  → Dann: chainguard_login falls Auth nötig")
+                if not issue.get("blocking"):
+                    lines.append("  → Oder: chainguard_finish(force=true) um zu überspringen")
+
+    # v4.15: Blocking issues cannot be skipped - even with force=true or confirmed=true!
+    if blocking_issues:
+        lines.append("")
+        lines.append("🚫 **BLOCKIERT** - HTTP-Tests sind Pflicht für Web-Dateien!")
+        lines.append("   Führe mindestens einen chainguard_test_endpoint() aus.")
+        return _text("\n".join(lines))
+
+    if not completion["complete"] and not force:
+        lines.append("")
+        lines.append("✗ **Kann nicht abschließen** - offene Punkte beheben oder `force=true`")
+        return _text("\n".join(lines))
+
+    # Step 1: Show impact check
+    if not confirmed and not state.impact_check_pending:
+        state.impact_check_pending = True
+        state.add_action("FINISH: Impact-Check")
+        await pm.save_async(state)
+
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        impact_msg = ImpactAnalyzer.format_impact_check(state.changed_files, scope_desc)
+        lines.append(impact_msg)
+
+        return _text("\n".join(lines))
+
+    # Step 2: Complete
+    if confirmed or force:
+        state.impact_check_pending = False
+        state.validations_passed += 1
+        state.files_since_validation = 0
+        state.phase = "done"
+        state.last_validation = datetime.now().isoformat()
+
+        # v5.2: Consolidate session learnings to memory before clearing state
+        if MEMORY_AVAILABLE:
+            await _consolidate_session_learnings(state, scope_desc)
+
+        state.changed_files = []  # Clear after consolidation
+
+        if force and not completion["complete"]:
+            state.add_action("FINISH: FORCED")
+            await pm.save_async(state, immediate=True)
+            lines.append("")
+            lines.append("⚠ **Task abgeschlossen (erzwungen)**")
+        else:
+            state.add_action("FINISH: CONFIRMED")
+            await pm.save_async(state, immediate=True)
+            lines.append("")
+            lines.append("✓ **Task erfolgreich abgeschlossen!**")
+
+        return _text("\n".join(lines))
+
+    lines.append("")
+    lines.append("⏳ **Impact-Check wurde angezeigt**")
+    lines.append("→ Bitte mit `chainguard_finish(confirmed=true)` bestätigen")
+    return _text("\n".join(lines))
+
+
+# =============================================================================
+# TEST RUNNER HANDLERS (v4.10)
+# =============================================================================
+
+@handler.register("chainguard_test_config")
+async def handle_test_config(args: Dict[str, Any]) -> List[TextContent]:
+    """Configure test command for project."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+
+    command = args.get("command", "")
+    test_args = args.get("args", "")
+    timeout = args.get("timeout", 300)
+
+    if not command:
+        # Show current config
+        if state.test_config:
+            cfg = state.test_config
+            return _text(f"Test Config:\n  Command: {cfg.get('command', '-')}\n  Args: {cfg.get('args', '-')}\n  Timeout: {cfg.get('timeout', 300)}s")
+        return _text("Kein Test-Command konfiguriert.\n\nBeispiel:\nchainguard_test_config(\n  command=\"./vendor/bin/phpunit\",\n  args=\"tests/\"\n)")
+
+    # Save config
+    state.test_config = {
+        "command": command,
+        "args": test_args,
+        "timeout": timeout
+    }
+    state.add_action(f"TEST_CFG: {command[:20]}")
+    await pm.save_async(state)
+
+    return _text(f"✓ Test-Config gespeichert:\n  {command} {test_args}")
+
+
+@handler.register("chainguard_run_tests")
+async def handle_run_tests(args: Dict[str, Any]) -> List[TextContent]:
+    """Run tests using configured command."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+
+    # Check for config
+    if not state.test_config or not state.test_config.get("command"):
+        return _text("✗ Kein Test-Command konfiguriert.\n\nZuerst: chainguard_test_config(command=\"...\")")
+
+    # Build config
+    config = TestConfig.from_dict(state.test_config)
+
+    # Run tests
+    result = await TestRunner.run_async(config, state.project_path)
+
+    # Update state
+    state.test_results = result.to_dict()
+    state.last_test_run = datetime.now().isoformat()
+    state.tests_passed = result.passed
+    state.tests_failed = result.failed
+
+    # Add action
+    status = "PASS" if result.success else "FAIL"
+    state.add_action(f"TEST: {status} {result.passed}/{result.total}")
+
+    # Create alert on failure
+    if not result.success and result.failed > 0:
+        state.alerts.append({
+            "msg": f"Tests fehlgeschlagen: {result.failed}/{result.total}",
+            "ack": False,
+            "ts": datetime.now().isoformat()
+        })
+
+    await pm.save_async(state)
+
+    # Format response
+    return _text(TestRunner.format_result(result))
+
+
+@handler.register("chainguard_test_status")
+async def handle_test_status(args: Dict[str, Any]) -> List[TextContent]:
+    """Show last test run status."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+
+    if not state.test_results:
+        return _text("Keine Tests ausgeführt.\n\nNutze: chainguard_run_tests()")
+
+    result = TestResult.from_dict(state.test_results)
+    status = TestRunner.format_status(result, state.last_test_run)
+
+    lines = [f"Test Status: {status}"]
+
+    if result.error_lines:
+        lines.append("\nFehler:")
+        for err in result.error_lines[:3]:
+            lines.append(f"  • {err}")
+
+    if state.test_config:
+        lines.append(f"\nCommand: {state.test_config.get('command', '-')}")
+
+    return _text("\n".join(lines))
+
+
+# =============================================================================
+# HISTORY / ERROR MEMORY HANDLERS (v4.11)
+# =============================================================================
+
+@handler.register("chainguard_recall")
+async def handle_recall(args: Dict[str, Any]) -> List[TextContent]:
+    """Search error history for similar issues and their resolutions."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    query = args.get("query", "")
+    limit = args.get("limit", 5)
+
+    if not query:
+        return _text("⚠ Query required. Example: chainguard_recall(query=\"php syntax Controller\")")
+
+    # Search error index
+    results = await HistoryManager.recall(
+        project_id=state.project_id,
+        query=query,
+        limit=limit
+    )
+
+    if not results:
+        return _text(f"Keine Einträge für '{query}' gefunden.")
+
+    lines = [f"🔍 {len(results)} Ergebnis(se) für '{query}':", ""]
+
+    for i, entry in enumerate(results, 1):
+        # Time ago
+        try:
+            ts = datetime.fromisoformat(entry.ts)
+            days_ago = (datetime.now() - ts).days
+            if days_ago == 0:
+                time_str = "heute"
+            elif days_ago == 1:
+                time_str = "gestern"
+            else:
+                time_str = f"vor {days_ago}d"
+        except ValueError:
+            time_str = entry.ts[:10]
+
+        lines.append(f"{i}. **{entry.file_pattern}** ({time_str})")
+        lines.append(f"   Type: {entry.error_type}")
+        lines.append(f"   Error: {entry.error_msg[:60]}...")
+
+        if entry.resolution:
+            lines.append(f"   ✓ Fix: {entry.resolution}")
+        else:
+            lines.append(f"   ? Kein Fix dokumentiert")
+
+        if entry.scope_desc:
+            lines.append(f"   Scope: {entry.scope_desc[:40]}")
+        lines.append("")
+
+    state.add_action(f"RECALL: {query[:20]}")
+    await pm.save_async(state)
+
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_history")
+async def handle_history(args: Dict[str, Any]) -> List[TextContent]:
+    """View recent change history for the current project."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    limit = args.get("limit", 20)
+    scope_only = args.get("scope_only", False)
+
+    scope_id = None
+    if scope_only and state.scope:
+        scope_id = state.scope.created_at
+
+    entries = await HistoryManager.get_history(
+        project_id=state.project_id,
+        limit=limit,
+        scope_id=scope_id
+    )
+
+    if not entries:
+        return _text("Keine History-Einträge vorhanden.")
+
+    lines = [f"📜 {len(entries)} Einträge" + (" (aktueller Scope)" if scope_only else ""), ""]
+
+    for entry in entries[:limit]:
+        # Format: HH:MM action file [validation]
+        ts_short = entry.ts[11:16] if len(entry.ts) > 16 else entry.ts[:5]
+        val_icon = "✓" if entry.validation == "PASS" else "✗"
+
+        file_short = Path(entry.file).name if entry.file else "?"
+        lines.append(f"{ts_short} {entry.action:6} {file_short:20} {val_icon}")
+
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_learn")
+async def handle_learn(args: Dict[str, Any]) -> List[TextContent]:
+    """Document a fix/resolution for the most recent error."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    resolution = args.get("resolution", "")
+    file_pattern = args.get("file_pattern", "")
+    error_type = args.get("error_type", "")
+
+    if not resolution:
+        return _text("⚠ resolution required. Example: chainguard_learn(resolution=\"Missing semicolon before }\")")
+
+    # If no specific pattern given, try to find the most recent error
+    if not file_pattern or not error_type:
+        # Look for recent syntax errors in alerts
+        recent_errors = [a for a in state.alerts if "errors" in a and not a.get("ack")]
+        if recent_errors:
+            last_error = recent_errors[-1]
+            if "errors" in last_error and last_error["errors"]:
+                err = last_error["errors"][0]
+                error_type = error_type or err.get("type", "")
+                file = err.get("file", "")
+                if file:
+                    # HistoryManager is already imported at module level
+                    file_pattern = file_pattern or HistoryManager._extract_pattern(Path(file).name)
+
+    if not file_pattern or not error_type:
+        return _text("⚠ Kein kürzlicher Fehler gefunden. Bitte file_pattern und error_type angeben.")
+
+    # Update the error index with the resolution
+    success = await HistoryManager.update_resolution(
+        project_id=state.project_id,
+        file_pattern=file_pattern,
+        error_type=error_type,
+        resolution=resolution
+    )
+
+    if success:
+        state.add_action(f"LEARN: {resolution[:20]}")
+        await pm.save_async(state)
+        return _text(f"✓ Resolution dokumentiert:\n   {file_pattern} ({error_type})\n   → {resolution}")
+
+    return _text(f"⚠ Kein passender Fehler gefunden für {file_pattern} / {error_type}")
+
+
+# =============================================================================
+# DATABASE INSPECTOR HANDLERS (v4.12)
+# =============================================================================
+
+@handler.register("chainguard_db_connect")
+async def handle_db_connect(args: Dict[str, Any]) -> List[TextContent]:
+    """Connect to database for schema inspection."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+
+    config = DBConfig(
+        host=args.get("host", "localhost"),
+        port=args.get("port", 3306),
+        user=args.get("user", ""),
+        password=args.get("password", ""),
+        database=args.get("database", ""),
+        db_type=args.get("db_type", "mysql")
+    )
+
+    if not config.user or not config.database:
+        return _text("⚠ user und database sind erforderlich")
+
+    inspector = get_inspector(state.project_id)
+    result = await inspector.connect(config)
+
+    if result["success"]:
+        # Store config reference in state (not credentials!)
+        state.db_config = {
+            "host": config.host,
+            "port": config.port,
+            "database": config.database,
+            "db_type": config.db_type,
+            "connected": True
+        }
+        state.add_action(f"DB: {config.database}")
+        await pm.save_async(state)
+
+        version = result.get("version", "")
+        return _text(f"✓ Connected to {config.database} ({config.db_type} {version})")
+
+    return _text(f"✗ Connection failed: {result.get('message', 'Unknown error')}")
+
+
+@handler.register("chainguard_db_schema")
+async def handle_db_schema(args: Dict[str, Any]) -> List[TextContent]:
+    """Get database schema with caching."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    refresh = args.get("refresh", False)
+
+    inspector = get_inspector(state.project_id)
+
+    if not inspector.is_connected():
+        return _text("✗ Keine DB verbunden. Zuerst: chainguard_db_connect(...)")
+
+    schema = await inspector.get_schema(force_refresh=refresh)
+
+    if not schema:
+        return _text("✗ Schema konnte nicht geladen werden")
+
+    # v4.18: Mark schema as checked with timestamp (enables TTL-based validation)
+    state.set_schema_checked()
+    state.add_action(f"SCHEMA: {len(schema.tables)} tables")
+    # v4.19: immediate=True for enforcement-state sync (critical for PreToolUse hook)
+    await pm.save_async(state, immediate=True)
+
+    return _text(inspector.format_schema(schema))
+
+
+@handler.register("chainguard_db_table")
+async def handle_db_table(args: Dict[str, Any]) -> List[TextContent]:
+    """Get detailed info for a single table."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    table = args.get("table", "")
+    sample = args.get("sample", False)
+
+    if not table:
+        return _text("⚠ table parameter erforderlich")
+
+    inspector = get_inspector(state.project_id)
+
+    if not inspector.is_connected():
+        return _text("✗ Keine DB verbunden. Zuerst: chainguard_db_connect(...)")
+
+    details = await inspector.get_table_details(table, show_sample=sample)
+
+    if not details:
+        return _text(f"✗ Tabelle '{table}' nicht gefunden")
+
+    state.add_action(f"TABLE: {table}")
+    await pm.save_async(state)
+
+    return _text(details)
+
+
+@handler.register("chainguard_db_disconnect")
+async def handle_db_disconnect(args: Dict[str, Any]) -> List[TextContent]:
+    """Disconnect from database and clear cache."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+
+    clear_inspector(state.project_id)
+    state.db_config = {}
+    state.add_action("DB: disconnected")
+    await pm.save_async(state)
+
+    return _text("✓ Datenbankverbindung getrennt, Cache gelöscht")
+
+
+# =============================================================================
+# MODE-SPECIFIC HANDLERS (v5.0)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# CONTENT MODE HANDLERS
+# -----------------------------------------------------------------------------
+
+@handler.register("chainguard_word_count")
+async def handle_word_count(args: Dict[str, Any]) -> List[TextContent]:
+    """Get word count statistics (CONTENT mode)."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    file = args.get("file")
+
+    if file:
+        # Count words in specific file
+        try:
+            file_path = Path(state.project_path) / file if not Path(file).is_absolute() else Path(file)
+            if file_path.exists():
+                content = file_path.read_text(encoding='utf-8', errors='ignore')
+                word_count = len(content.split())
+                return _text(f"📝 {file}: {word_count} words")
+            else:
+                return _text(f"⚠ File not found: {file}")
+        except Exception as e:
+            return _text(f"⚠ Error reading file: {str(e)[:50]}")
+
+    # Show overall statistics
+    chapters_done = sum(1 for s in state.chapter_status.values() if s == "done")
+    chapters_draft = sum(1 for s in state.chapter_status.values() if s == "draft")
+    chapters_review = sum(1 for s in state.chapter_status.values() if s == "review")
+
+    lines = ["📊 **Word Count Statistics**", ""]
+    lines.append(f"Total: **{state.word_count_total}** words")
+    lines.append("")
+
+    if state.chapter_status:
+        lines.append("**Chapters:**")
+        for chapter, status in state.chapter_status.items():
+            icon = {"done": "✓", "review": "👁", "draft": "✏"}.get(status, "?")
+            lines.append(f"  {icon} {chapter}: {status}")
+        lines.append("")
+        lines.append(f"Progress: {chapters_done} done, {chapters_review} review, {chapters_draft} draft")
+
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_track_chapter")
+async def handle_track_chapter(args: Dict[str, Any]) -> List[TextContent]:
+    """Track chapter progress (CONTENT mode)."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    chapter = args["chapter"]
+    status = args["status"]
+    word_count = args.get("word_count")
+
+    state.set_chapter_status(chapter, status)
+
+    if word_count:
+        # Update total word count (simplistic - add if new, assume same if updating)
+        state.word_count_total += word_count
+
+    state.add_action(f"CHAPTER: {chapter}={status}")
+    await pm.save_async(state)
+
+    icon = {"done": "✓", "review": "👁", "draft": "✏"}.get(status, "?")
+    result = f"{icon} Chapter '{chapter}': {status}"
+    if word_count:
+        result += f" ({word_count} words)"
+
+    return _text(result)
+
+
+# -----------------------------------------------------------------------------
+# DEVOPS MODE HANDLERS
+# -----------------------------------------------------------------------------
+
+@handler.register("chainguard_log_command")
+async def handle_log_command(args: Dict[str, Any]) -> List[TextContent]:
+    """Log executed command (DEVOPS mode)."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    command = args["command"]
+    result = args.get("result", "success")
+    output = args.get("output", "")
+
+    state.add_command(command, result, output)
+    state.add_action(f"CMD: {command[:20]}")
+    await pm.save_async(state)
+
+    icon = "✓" if result == "success" else "✗"
+    return _text(f"{icon} Logged: {command[:50]}")
+
+
+@handler.register("chainguard_checkpoint")
+async def handle_checkpoint(args: Dict[str, Any]) -> List[TextContent]:
+    """Create rollback checkpoint (DEVOPS mode)."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    name = args["name"]
+    files = args.get("files", [])
+
+    state.add_checkpoint(name, files)
+    state.add_action(f"CHECKPOINT: {name}")
+    await pm.save_async(state)
+
+    lines = [f"💾 Checkpoint created: **{name}**"]
+    if files:
+        lines.append(f"   Files: {', '.join(files[:5])}")
+        if len(files) > 5:
+            lines.append(f"   +{len(files) - 5} more")
+    lines.append(f"   Total checkpoints: {len(state.checkpoints)}")
+
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_health_check")
+async def handle_health_check(args: Dict[str, Any]) -> List[TextContent]:
+    """Run health checks (DEVOPS mode)."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    endpoints = args.get("endpoints", [])
+    services = args.get("services", [])
+
+    results = []
+
+    # Check endpoints
+    if endpoints:
+        for url in endpoints[:10]:  # Limit to 10
+            try:
+                # Use http_session_manager for endpoint checks
+                result = await http_session_manager.test_endpoint(
+                    url=url, method="GET", project_id=state.project_id
+                )
+                status = "✓" if result["success"] else "✗"
+                code = result.get("status_code", "?")
+                results.append(f"{status} {url}: {code}")
+            except Exception as e:
+                results.append(f"✗ {url}: {str(e)[:30]}")
+
+    # Check services (Linux systemd)
+    if services:
+        import asyncio
+        for service in services[:10]:  # Limit to 10
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "systemctl", "is-active", service,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+                status_str = stdout.decode().strip()
+                icon = "✓" if status_str == "active" else "✗"
+                results.append(f"{icon} {service}: {status_str}")
+            except Exception:
+                results.append(f"? {service}: unknown")
+
+    state.add_action(f"HEALTH: {len(endpoints)}e/{len(services)}s")
+    await pm.save_async(state)
+
+    if not results:
+        return _text("⚠ No endpoints or services specified")
+
+    # Summary
+    ok_count = sum(1 for r in results if r.startswith("✓"))
+    total = len(results)
+
+    lines = [f"🏥 **Health Check: {ok_count}/{total} OK**", ""]
+    lines.extend(results)
+
+    return _text("\n".join(lines))
+
+
+# -----------------------------------------------------------------------------
+# RESEARCH MODE HANDLERS
+# -----------------------------------------------------------------------------
+
+@handler.register("chainguard_add_source")
+async def handle_add_source(args: Dict[str, Any]) -> List[TextContent]:
+    """Track research source (RESEARCH mode)."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    url = args["url"]
+    title = args.get("title", "")
+    relevance = args.get("relevance", "medium")
+
+    state.add_source(url, title, relevance)
+    state.add_action(f"SOURCE: {title[:20] or url[:20]}")
+    await pm.save_async(state)
+
+    icon = {"high": "⭐", "medium": "📄", "low": "📎"}.get(relevance, "📄")
+    return _text(f"{icon} Source added: {title or url[:40]} ({relevance})")
+
+
+@handler.register("chainguard_index_fact")
+async def handle_index_fact(args: Dict[str, Any]) -> List[TextContent]:
+    """Index discovered fact (RESEARCH mode)."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    fact = args["fact"]
+    source = args.get("source", "")
+    confidence = args.get("confidence", "likely")
+
+    state.add_fact(fact, source, confidence)
+    state.add_action(f"FACT: {fact[:20]}")
+    await pm.save_async(state)
+
+    icon = {"verified": "✓", "likely": "○", "uncertain": "?"}.get(confidence, "○")
+    result = f"{icon} Fact indexed ({confidence}): {fact[:60]}"
+    if source:
+        result += f"\n   Source: {source[:40]}"
+
+    return _text(result)
+
+
+@handler.register("chainguard_sources")
+async def handle_sources(args: Dict[str, Any]) -> List[TextContent]:
+    """List all tracked sources (RESEARCH mode)."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+
+    if not state.sources:
+        return _text("📚 No sources tracked yet.\n\nUse: chainguard_add_source(url=\"...\")")
+
+    # Group by relevance
+    high = [s for s in state.sources if s.get("relevance") == "high"]
+    medium = [s for s in state.sources if s.get("relevance") == "medium"]
+    low = [s for s in state.sources if s.get("relevance") == "low"]
+
+    lines = [f"📚 **{len(state.sources)} Sources**", ""]
+
+    if high:
+        lines.append("⭐ **High Relevance:**")
+        for s in high[:5]:
+            title = s.get("title") or s.get("url", "")[:40]
+            lines.append(f"   • {title}")
+        lines.append("")
+
+    if medium:
+        lines.append("📄 **Medium Relevance:**")
+        for s in medium[:5]:
+            title = s.get("title") or s.get("url", "")[:40]
+            lines.append(f"   • {title}")
+        lines.append("")
+
+    if low:
+        lines.append(f"📎 Low Relevance: {len(low)} sources")
+
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_facts")
+async def handle_facts(args: Dict[str, Any]) -> List[TextContent]:
+    """List all indexed facts (RESEARCH mode)."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+
+    if not state.facts:
+        return _text("🔬 No facts indexed yet.\n\nUse: chainguard_index_fact(fact=\"...\")")
+
+    # Group by confidence
+    verified = [f for f in state.facts if f.get("confidence") == "verified"]
+    likely = [f for f in state.facts if f.get("confidence") == "likely"]
+    uncertain = [f for f in state.facts if f.get("confidence") == "uncertain"]
+
+    lines = [f"🔬 **{len(state.facts)} Facts**", ""]
+
+    if verified:
+        lines.append("✓ **Verified:**")
+        for f in verified[:5]:
+            lines.append(f"   • {f.get('fact', '')[:60]}")
+        lines.append("")
+
+    if likely:
+        lines.append("○ **Likely:**")
+        for f in likely[:5]:
+            lines.append(f"   • {f.get('fact', '')[:60]}")
+        lines.append("")
+
+    if uncertain:
+        lines.append(f"? Uncertain: {len(uncertain)} facts")
+
+    return _text("\n".join(lines))
+
+
+# =============================================================================
+# MEMORY HANDLERS (v5.1 - Long-Term Memory)
+# =============================================================================
+
+@handler.register("chainguard_memory_init")
+async def handle_memory_init(args: Dict[str, Any]) -> List[TextContent]:
+    """Initialize project memory with full code indexing."""
+    if not MEMORY_AVAILABLE:
+        return _text("✗ Memory not available. Install: pip install chromadb sentence-transformers")
+
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    include_patterns = args.get("include_patterns", ["**/*.py", "**/*.php", "**/*.js", "**/*.ts", "**/*.tsx"])
+    exclude_patterns = args.get("exclude_patterns", ["node_modules", "vendor", ".git", "__pycache__", "*.min.js"])
+    force = args.get("force", False)
+
+    project_id = get_project_id(state.project_path)
+
+    # Check if memory already exists
+    if await memory_manager.memory_exists(project_id) and not force:
+        return _text(
+            f"✓ Memory bereits initialisiert für {state.project_name}\n"
+            "→ Nutze force=true zum Neuinitialisieren\n"
+            "→ Oder chainguard_memory_query() zum Suchen"
+        )
+
+    memory = await memory_manager.get_memory(project_id, state.project_path)
+
+    # Index project files
+    indexed_files = 0
+    indexed_functions = 0
+    errors = []
+
+    project_path = Path(state.project_path)
+
+    for pattern in include_patterns:
+        try:
+            for file_path in project_path.glob(pattern):
+                # Skip excluded patterns
+                path_str = str(file_path)
+                if any(excl in path_str for excl in exclude_patterns):
+                    continue
+
+                # Skip sensitive files
+                if not should_index_file(path_str):
+                    continue
+
+                # Skip if not a file
+                if not file_path.is_file():
+                    continue
+
+                try:
+                    # Read file content
+                    content = file_path.read_text(encoding='utf-8', errors='ignore')
+                    if not content.strip():
+                        continue
+
+                    # Create document for file
+                    relative_path = str(file_path.relative_to(project_path))
+                    file_summary = _create_file_summary(file_path, content)
+
+                    await memory.add(
+                        content=file_summary,
+                        collection="code_structure",
+                        metadata={
+                            "type": "file",
+                            "path": relative_path,
+                            "language": file_path.suffix.lstrip('.'),
+                            "lines": len(content.splitlines()),
+                        },
+                        doc_id=f"file:{relative_path}"
+                    )
+                    indexed_files += 1
+
+                    # Extract functions/classes using AST-Analyzer
+                    functions = _extract_functions(content, file_path.suffix, str(file_path))
+                    for func in functions:
+                        # ChromaDB doesn't accept None values in metadata
+                        await memory.add(
+                            content=func["description"],
+                            collection="functions",
+                            metadata={
+                                "type": func["type"],
+                                "name": func["name"],
+                                "path": relative_path,
+                                "params": ",".join(func.get("params", [])),  # Join list to string
+                                "signature": func.get("signature") or "",
+                                "parent": func.get("parent") or "",
+                                "return_type": func.get("return_type") or "",
+                                "line_start": func.get("line_start", 0),
+                            },
+                            doc_id=f"func:{relative_path}:{func['name']}"
+                        )
+                        indexed_functions += 1
+
+                    # v5.4: Create deep logic summary using CodeSummarizer
+                    if SUMMARIZER_AVAILABLE and code_summarizer:
+                        try:
+                            summary = code_summarizer.summarize_file(file_path, content)
+                            summary_text = summary.to_text(max_length=2000)
+
+                            if summary_text.strip():
+                                await memory.add(
+                                    content=summary_text,
+                                    collection="code_summaries",
+                                    metadata={
+                                        "type": "logic_summary",
+                                        "path": relative_path,
+                                        "language": summary.language,
+                                        "purpose": summary.purpose[:200] if summary.purpose else "",
+                                        "class_count": len(summary.classes),
+                                        "function_count": len(summary.functions),
+                                    },
+                                    doc_id=f"summary:{relative_path}"
+                                )
+                        except Exception as sum_err:
+                            logger.debug(f"Summary error for {relative_path}: {sum_err}")
+
+                except Exception as e:
+                    errors.append(f"{file_path.name}: {str(e)[:30]}")
+
+        except Exception as e:
+            errors.append(f"Pattern {pattern}: {str(e)[:30]}")
+
+    # Save metadata
+    await memory.save_metadata(
+        initialized_at=datetime.now().isoformat(),
+        indexed_files=indexed_files,
+        indexed_functions=indexed_functions,
+        include_patterns=include_patterns,
+        exclude_patterns=exclude_patterns
+    )
+
+    # v5.4: Auto-detect and store architecture
+    architecture_indexed = False
+    try:
+        from .architecture import architecture_detector
+        analysis = architecture_detector.analyze(state.project_path)
+
+        # Always store main architecture info (even with low confidence)
+        arch_content = (
+            f"Project architecture: {analysis.pattern.value}. "
+            f"Framework: {analysis.framework.value if analysis.framework else 'unknown'}. "
+            f"Detected layers: {', '.join(analysis.detected_layers[:5]) if analysis.detected_layers else 'none'}. "
+            f"Design patterns: {', '.join(analysis.detected_patterns[:5]) if analysis.detected_patterns else 'none'}."
+        )
+        await memory.upsert(
+            content=arch_content,
+            collection="architecture",
+            metadata={
+                "type": "architecture",
+                "name": "project_architecture",
+                "pattern": analysis.pattern.value,
+                "framework": analysis.framework.value if analysis.framework else "",
+                "confidence": analysis.confidence,
+                "layers": ",".join(analysis.detected_layers[:10]) if analysis.detected_layers else "",
+                "design_patterns": ",".join(analysis.detected_patterns[:10]) if analysis.detected_patterns else "",
+            },
+            doc_id="arch:main"
+        )
+        architecture_indexed = True
+
+        # Store each detected layer as separate document for better search
+        for layer in analysis.detected_layers[:10]:
+            layer_content = f"Architecture layer: {layer} in {analysis.pattern.value} pattern."
+            await memory.upsert(
+                content=layer_content,
+                collection="architecture",
+                metadata={
+                    "type": "layer",
+                    "name": layer,
+                    "pattern": analysis.pattern.value,
+                },
+                doc_id=f"arch:layer:{layer.lower()}"
+            )
+
+        # Store design patterns (always, even with low architecture confidence)
+        for pattern in analysis.detected_patterns[:10]:
+            pattern_content = f"Design pattern: {pattern} detected in codebase."
+            await memory.upsert(
+                content=pattern_content,
+                collection="architecture",
+                metadata={
+                    "type": "design_pattern",
+                    "name": pattern,
+                },
+                doc_id=f"arch:pattern:{pattern.lower()}"
+            )
+    except Exception as e:
+        errors.append(f"Architecture detection: {str(e)[:30]}")
+
+    state.add_action(f"MEMORY_INIT: {indexed_files}f/{indexed_functions}fn")
+    await pm.save_async(state)
+
+    # Get stats
+    stats = await memory.get_stats()
+
+    # Count summaries
+    summaries_count = stats.collections.get("code_summaries", 0)
+
+    lines = [f"✓ Memory initialisiert für: {state.project_name}", ""]
+    lines.append("📊 **Indexiert:**")
+    lines.append(f"   - {indexed_files} Dateien")
+    lines.append(f"   - {indexed_functions} Funktionen/Methoden")
+    if summaries_count > 0:
+        lines.append(f"   - {summaries_count} Code-Logik-Summaries")
+    if architecture_indexed:
+        lines.append(f"   - Architecture: {analysis.pattern.value} ({analysis.confidence:.0%})")
+    lines.append(f"   - {stats.total_documents} Dokumente total")
+    lines.append("")
+    lines.append(f"💾 Speicher: {stats.storage_size_mb:.1f} MB")
+
+    if errors:
+        lines.append("")
+        lines.append(f"⚠ {len(errors)} Fehler beim Indexieren")
+        for err in errors[:3]:
+            lines.append(f"   - {err}")
+
+    lines.append("")
+    lines.append("→ Nutze chainguard_memory_query() für semantische Suchen")
+
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_memory_query")
+async def handle_memory_query(args: Dict[str, Any]) -> List[TextContent]:
+    """Semantic search in project memory."""
+    if not MEMORY_AVAILABLE:
+        return _text("✗ Memory not available. Install: pip install chromadb sentence-transformers")
+
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    query = args.get("query", "")
+    limit = args.get("limit", 5)
+    filter_type = args.get("filter_type", "all")
+
+    if not query:
+        return _text("⚠ query required. Example: chainguard_memory_query(query=\"Where is authentication handled?\")")
+
+    project_id = get_project_id(state.project_path)
+
+    if not await memory_manager.memory_exists(project_id):
+        return _text(
+            "✗ Memory nicht initialisiert.\n"
+            "→ Zuerst: chainguard_memory_init()"
+        )
+
+    memory = await memory_manager.get_memory(project_id, state.project_path)
+
+    # Map filter_type to collection
+    collection = "all"
+    if filter_type == "code":
+        collection = "code_structure"
+    elif filter_type == "functions":
+        collection = "functions"
+    elif filter_type == "database":
+        collection = "database_schema"
+    elif filter_type == "architecture":
+        collection = "architecture"
+
+    # Query memory
+    results = await memory.query(
+        query_text=query,
+        collection=collection,
+        n_results=limit * 2  # Get more, then filter by score
+    )
+
+    if not results:
+        return _text(f"🔍 Keine Ergebnisse für: \"{query}\"")
+
+    # Extract keywords for scoring
+    keywords = KeywordExtractor.extract(query)
+    task_type = detect_task_type(query)
+
+    # Score and sort results
+    scored_results = []
+    for doc, distance in results:
+        scored = RelevanceScorer.score(
+            document=doc,
+            semantic_distance=distance,
+            keywords=keywords,
+            task_type=task_type,
+            collection=doc.metadata.get("_collection", "unknown")
+        )
+        scored_results.append(scored)
+
+    scored_results.sort(key=lambda x: x.final_score, reverse=True)
+
+    # Format output
+    lines = [f"🔍 Query: \"{query}\"", ""]
+    lines.append(f"📍 **Relevante Stellen (Top {min(limit, len(scored_results))}):**")
+    lines.append("")
+
+    for i, result in enumerate(scored_results[:limit], 1):
+        doc = result.document
+        score = result.final_score
+        path = doc.metadata.get("path", doc.metadata.get("name", "unknown"))
+
+        lines.append(f"{i}. [{score:.2f}] **{path}**")
+
+        # Show summary
+        summary = ContextFormatter._get_summary(doc)
+        if summary:
+            lines.append(f"   └─ {summary}")
+
+        lines.append("")
+
+    state.add_action(f"QUERY: {query[:20]}")
+    await pm.save_async(state)
+
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_memory_update")
+async def handle_memory_update(args: Dict[str, Any]) -> List[TextContent]:
+    """Manual memory update for specific files or learnings."""
+    if not MEMORY_AVAILABLE:
+        return _text("✗ Memory not available. Install: pip install chromadb sentence-transformers")
+
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    action = args.get("action", "reindex_file")
+    file_path = args.get("file_path", "")
+    learning = args.get("learning", "")
+
+    project_id = get_project_id(state.project_path)
+
+    if not await memory_manager.memory_exists(project_id):
+        return _text("✗ Memory nicht initialisiert. Zuerst: chainguard_memory_init()")
+
+    memory = await memory_manager.get_memory(project_id, state.project_path)
+
+    if action == "reindex_file":
+        if not file_path:
+            return _text("⚠ file_path required for reindex_file action")
+
+        full_path = Path(state.project_path) / file_path if not Path(file_path).is_absolute() else Path(file_path)
+
+        if not full_path.exists():
+            return _text(f"✗ File not found: {file_path}")
+
+        try:
+            content = full_path.read_text(encoding='utf-8', errors='ignore')
+            relative_path = str(full_path.relative_to(state.project_path))
+            file_summary = _create_file_summary(full_path, content)
+
+            await memory.upsert(
+                content=file_summary,
+                collection="code_structure",
+                metadata={
+                    "type": "file",
+                    "path": relative_path,
+                    "language": full_path.suffix.lstrip('.'),
+                    "lines": len(content.splitlines()),
+                },
+                doc_id=f"file:{relative_path}"
+            )
+
+            # Invalidate context cache
+            context_injector.invalidate_cache(project_id)
+
+            state.add_action(f"MEM_UPDATE: {full_path.name}")
+            await pm.save_async(state)
+
+            return _text(f"✓ Re-indexed: {relative_path}")
+
+        except Exception as e:
+            return _text(f"✗ Error reindexing: {str(e)[:50]}")
+
+    elif action == "add_learning":
+        if not learning:
+            return _text("⚠ learning required for add_learning action")
+
+        await memory.add(
+            content=learning,
+            collection="learnings",
+            metadata={
+                "type": "learning",
+                "scope": state.scope.description if state.scope else "",
+                "added_by": "manual",
+            }
+        )
+
+        state.add_action(f"LEARNING: {learning[:20]}")
+        await pm.save_async(state)
+
+        return _text(f"✓ Learning added: {learning[:60]}")
+
+    elif action == "cleanup":
+        # Remove old entries (placeholder for future implementation)
+        return _text("✓ Cleanup completed (no action needed)")
+
+    return _text(f"⚠ Unknown action: {action}")
+
+
+@handler.register("chainguard_memory_status")
+async def handle_memory_status(args: Dict[str, Any]) -> List[TextContent]:
+    """Show memory status and statistics."""
+    if not MEMORY_AVAILABLE:
+        return _text("✗ Memory not available. Install: pip install chromadb sentence-transformers")
+
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+
+    project_id = get_project_id(state.project_path)
+
+    if not await memory_manager.memory_exists(project_id):
+        return _text(
+            f"📊 Memory Status: {state.project_name}\n\n"
+            "❌ Nicht initialisiert\n"
+            "→ Nutze: chainguard_memory_init()"
+        )
+
+    memory = await memory_manager.get_memory(project_id, state.project_path)
+    stats = await memory.get_stats()
+
+    lines = [f"📊 **Memory Status: {state.project_name}**", ""]
+
+    if stats.initialized_at:
+        lines.append(f"Initialisiert: {stats.initialized_at[:16]}")
+    if stats.last_update:
+        lines.append(f"Letztes Update: {stats.last_update[:16]}")
+
+    lines.append("")
+    lines.append("**Collections:**")
+    for name, count in stats.collections.items():
+        lines.append(f"├─ {name}: {count} Dokumente")
+
+    lines.append("")
+    lines.append(f"**Total:** {stats.total_documents} Dokumente")
+    lines.append(f"**Speicher:** {stats.storage_size_mb:.2f} MB")
+    lines.append(f"**Embedding-Model:** all-MiniLM-L6-v2")
+
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_memory_summarize")
+async def handle_memory_summarize(args: Dict[str, Any]) -> List[TextContent]:
+    """
+    Generate deep logic summaries for a specific file or the entire project.
+
+    This tool extracts and stores detailed descriptions of code logic,
+    not just structure. It analyzes docstrings, comments, and code patterns
+    to create human-readable summaries of what each file/function does.
+
+    Args:
+        file: Optional specific file to summarize (relative or absolute path)
+        force: If true, re-summarize even if summary exists
+
+    Returns:
+        Summary of the file(s) processed
+    """
+    if not MEMORY_AVAILABLE:
+        return _text("✗ Memory not available. Install: pip install chromadb sentence-transformers")
+
+    if not SUMMARIZER_AVAILABLE or not code_summarizer:
+        return _text("✗ Code Summarizer not available. Check installation.")
+
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    file_path = args.get("file", "")
+    force = args.get("force", False)
+
+    project_id = get_project_id(state.project_path)
+
+    if not await memory_manager.memory_exists(project_id):
+        return _text(
+            "✗ Memory nicht initialisiert.\n"
+            "→ Zuerst: chainguard_memory_init()"
+        )
+
+    memory = await memory_manager.get_memory(project_id, state.project_path)
+    project_path = Path(state.project_path)
+
+    if file_path:
+        # Summarize single file
+        full_path = project_path / file_path if not Path(file_path).is_absolute() else Path(file_path)
+
+        if not full_path.exists():
+            return _text(f"✗ File not found: {file_path}")
+
+        if not full_path.is_file():
+            return _text(f"✗ Not a file: {file_path}")
+
+        try:
+            content = full_path.read_text(encoding='utf-8', errors='ignore')
+            relative_path = str(full_path.relative_to(project_path))
+
+            summary = code_summarizer.summarize_file(full_path, content)
+            summary_text = summary.to_text(max_length=2000)
+
+            if not summary_text.strip():
+                return _text(f"⚠ No meaningful content to summarize in: {relative_path}")
+
+            await memory.upsert(
+                content=summary_text,
+                collection="code_summaries",
+                metadata={
+                    "type": "logic_summary",
+                    "path": relative_path,
+                    "language": summary.language,
+                    "purpose": summary.purpose[:200] if summary.purpose else "",
+                    "class_count": len(summary.classes),
+                    "function_count": len(summary.functions),
+                },
+                doc_id=f"summary:{relative_path}"
+            )
+
+            # Invalidate context cache
+            context_injector.invalidate_cache(project_id)
+
+            lines = [f"✓ Summary erstellt für: {relative_path}", ""]
+            lines.append(f"**Zweck:** {summary.purpose}")
+            lines.append("")
+
+            if summary.classes:
+                lines.append("**Klassen:**")
+                for cls in summary.classes[:5]:
+                    lines.append(f"  • {cls.name}: {cls.get_purpose()}")
+
+            if summary.functions:
+                lines.append("**Funktionen:**")
+                for func in summary.functions[:8]:
+                    lines.append(f"  • {func.name}: {func.get_purpose()}")
+
+            if summary.important_comments:
+                lines.append("")
+                lines.append("**Wichtige Notizen:**")
+                for comment in summary.important_comments[:3]:
+                    lines.append(f"  • {comment[:80]}")
+
+            return _text("\n".join(lines))
+
+        except Exception as e:
+            return _text(f"✗ Error summarizing file: {str(e)[:100]}")
+
+    else:
+        # Summarize all files (re-run for entire project)
+        include_patterns = ["**/*.py", "**/*.php", "**/*.js", "**/*.ts", "**/*.tsx"]
+        exclude_patterns = ["node_modules", "vendor", ".git", "__pycache__", "*.min.js"]
+
+        summarized = 0
+        errors = []
+
+        for pattern in include_patterns:
+            try:
+                for fp in project_path.glob(pattern):
+                    path_str = str(fp)
+                    if any(excl in path_str for excl in exclude_patterns):
+                        continue
+                    if not should_index_file(path_str):
+                        continue
+                    if not fp.is_file():
+                        continue
+
+                    try:
+                        content = fp.read_text(encoding='utf-8', errors='ignore')
+                        if not content.strip():
+                            continue
+
+                        relative_path = str(fp.relative_to(project_path))
+
+                        # Check if summary exists and skip if not forcing
+                        if not force:
+                            existing = await memory.get(f"summary:{relative_path}", "code_summaries")
+                            if existing:
+                                continue
+
+                        summary = code_summarizer.summarize_file(fp, content)
+                        summary_text = summary.to_text(max_length=2000)
+
+                        if summary_text.strip():
+                            await memory.upsert(
+                                content=summary_text,
+                                collection="code_summaries",
+                                metadata={
+                                    "type": "logic_summary",
+                                    "path": relative_path,
+                                    "language": summary.language,
+                                    "purpose": summary.purpose[:200] if summary.purpose else "",
+                                    "class_count": len(summary.classes),
+                                    "function_count": len(summary.functions),
+                                },
+                                doc_id=f"summary:{relative_path}"
+                            )
+                            summarized += 1
+
+                    except Exception as e:
+                        errors.append(f"{fp.name}: {str(e)[:30]}")
+
+            except Exception as e:
+                errors.append(f"Pattern {pattern}: {str(e)[:30]}")
+
+        # Invalidate context cache
+        context_injector.invalidate_cache(project_id)
+
+        state.add_action(f"SUMMARIZE: {summarized} files")
+        await pm.save_async(state)
+
+        lines = [f"✓ {summarized} Dateien summarisiert", ""]
+
+        if errors:
+            lines.append(f"⚠ {len(errors)} Fehler:")
+            for err in errors[:5]:
+                lines.append(f"   - {err}")
+
+        lines.append("")
+        lines.append("→ Nutze chainguard_memory_query() für semantische Suchen")
+        lines.append("→ Filter mit filter_type='code' für Logik-Summaries")
+
+        return _text("\n".join(lines))
+
+
+# Helper functions for memory indexing
+def _create_file_summary(file_path: Path, content: str) -> str:
+    """Create a summary description for a file."""
+    name = file_path.name
+    lines = len(content.splitlines())
+    ext = file_path.suffix.lower()
+
+    # Detect common patterns
+    patterns = []
+    content_lower = content.lower()
+
+    if "class " in content or "interface " in content:
+        patterns.append("defines classes")
+    if "def " in content or "function " in content or "async function" in content:
+        patterns.append("contains functions")
+    if "import " in content or "require(" in content or "use " in content:
+        patterns.append("has imports")
+    if "@route" in content_lower or "router." in content_lower or "app.get(" in content_lower:
+        patterns.append("defines routes")
+    if "test" in name.lower() or "spec" in name.lower():
+        patterns.append("test file")
+    if "model" in name.lower():
+        patterns.append("model definition")
+    if "controller" in name.lower():
+        patterns.append("controller")
+    if "config" in name.lower() or "settings" in name.lower():
+        patterns.append("configuration")
+
+    pattern_str = ", ".join(patterns) if patterns else "general code"
+
+    # First comment/docstring as description
+    first_comment = ""
+    if ext == ".py":
+        # Python docstring
+        import re
+        match = re.search(r'"""(.*?)"""', content, re.DOTALL)
+        if match:
+            first_comment = match.group(1).strip()[:100]
+    elif ext in [".php", ".js", ".ts"]:
+        # PHPDoc/JSDoc style
+        import re
+        match = re.search(r'/\*\*(.*?)\*/', content, re.DOTALL)
+        if match:
+            first_comment = match.group(1).strip()[:100]
+            first_comment = re.sub(r'[\s*]+', ' ', first_comment)
+
+    summary = f"{name}: {pattern_str}. {lines} lines."
+    if first_comment:
+        summary += f" {first_comment}"
+
+    return summary[:500]  # Limit length
+
+
+def _extract_functions(content: str, suffix: str, file_path: str = "") -> list:
+    """Extract functions/methods from code using AST-Analyzer.
+
+    Uses the ast_analyzer module for precise extraction with tree-sitter
+    or regex fallback. Returns richer metadata including signatures,
+    parent classes, and return types.
+    """
+    from .ast_analyzer import ast_analyzer, LANGUAGE_EXTENSIONS
+
+    # Get language from suffix
+    language = LANGUAGE_EXTENSIONS.get(suffix.lower())
+    if not language:
+        return []
+
+    # Use AST analyzer for extraction
+    analysis = ast_analyzer.analyze_file(file_path, content) if file_path else None
+
+    if analysis is None:
+        # Fallback: use RegexAnalyzer directly
+        from .ast_analyzer import RegexAnalyzer
+        analysis = RegexAnalyzer.analyze(content, language, file_path or "unknown")
+
+    functions = []
+    seen_keys = set()  # Deduplicate by (name, line_start, parent)
+
+    for symbol in analysis.symbols:
+        # Skip non-function symbols for this collection
+        if symbol.type.value not in ["function", "method", "class"]:
+            continue
+
+        # Deduplicate: same name + line + parent = same symbol
+        dedup_key = (symbol.name, symbol.line_start, symbol.parent or "")
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+
+        func_data = {
+            "type": symbol.type.value,
+            "name": symbol.name,
+            "params": symbol.parameters[:5],
+            "description": symbol.to_memory_content(),
+            "signature": symbol.signature[:100] if symbol.signature else "",
+            "parent": symbol.parent,
+            "return_type": symbol.return_type,
+            "line_start": symbol.line_start,
+            "line_end": symbol.line_end,
+        }
+        functions.append(func_data)
+
+    return functions[:100]  # Limit to prevent too many entries
+
+
+# =============================================================================
+# MEMORY AUTO-UPDATE HELPERS (v5.2)
+# =============================================================================
+
+async def _update_memory_for_file(project_id: str, file_path: str, project_path: str):
+    """
+    Update memory for a single file (runs in background).
+
+    Called automatically when a file is tracked.
+    Non-blocking - errors are logged but don't affect the main flow.
+    """
+    if not MEMORY_AVAILABLE:
+        return
+
+    try:
+        # Check if file should be indexed
+        if not should_index_file(file_path):
+            return
+
+        # Get full path
+        full_path = Path(project_path) / file_path if not Path(file_path).is_absolute() else Path(file_path)
+
+        if not full_path.exists():
+            return
+
+        # Read file content
+        try:
+            content = full_path.read_text(encoding='utf-8', errors='ignore')
+        except Exception:
+            return
+
+        if not content.strip():
+            return
+
+        # Get memory instance
+        memory = await memory_manager.get_memory(project_id)
+
+        # Create relative path
+        try:
+            relative_path = str(full_path.relative_to(project_path))
+        except ValueError:
+            relative_path = file_path
+
+        # Update file summary
+        file_summary = _create_file_summary(full_path, content)
+        await memory.upsert(
+            content=file_summary,
+            collection="code_structure",
+            metadata={
+                "type": "file",
+                "path": relative_path,
+                "language": full_path.suffix.lstrip('.'),
+                "lines": len(content.splitlines()),
+            },
+            doc_id=f"file:{relative_path}"
+        )
+
+        # Update functions (re-extract)
+        functions = _extract_functions(content, full_path.suffix)
+        for func in functions[:20]:  # Limit per file
+            await memory.upsert(
+                content=func["description"],
+                collection="functions",
+                metadata={
+                    "type": func["type"],
+                    "name": func["name"],
+                    "path": relative_path,
+                    "params": func.get("params", []),
+                },
+                doc_id=f"func:{relative_path}:{func['name']}"
+            )
+
+        # Invalidate context cache for this project
+        context_injector.invalidate_cache(project_id)
+
+        logger.debug(f"Memory auto-updated: {relative_path}")
+
+    except Exception as e:
+        logger.debug(f"Memory auto-update failed for {file_path}: {e}")
+
+
+async def _delete_from_memory(project_id: str, file_path: str, project_path: str):
+    """
+    Remove a deleted file from memory (v5.3).
+
+    Called automatically when a file is tracked with action="delete".
+    Removes both the file entry and all associated function entries.
+    """
+    if not MEMORY_AVAILABLE:
+        return
+
+    try:
+        memory = await memory_manager.get_memory(project_id)
+
+        # Create relative path for matching
+        full_path = Path(project_path) / file_path if not Path(file_path).is_absolute() else Path(file_path)
+        try:
+            relative_path = str(full_path.relative_to(project_path))
+        except ValueError:
+            relative_path = file_path
+
+        # Delete file entry from code_structure
+        file_doc_id = f"file:{relative_path}"
+        await memory.delete(
+            collection="code_structure",
+            doc_ids=[file_doc_id]
+        )
+
+        # Delete all functions from this file
+        # We need to find and delete by path metadata
+        await memory.delete(
+            collection="functions",
+            where={"path": relative_path}
+        )
+
+        # Invalidate context cache
+        context_injector.invalidate_cache(project_id)
+
+        logger.debug(f"Memory cleanup: removed {relative_path}")
+
+    except Exception as e:
+        logger.debug(f"Memory delete failed for {file_path}: {e}")
+
+
+async def _consolidate_session_learnings(state, scope_desc: str):
+    """
+    Consolidate learnings from the current session into memory.
+
+    Called at finish() to persist insights from the work session.
+    """
+    if not MEMORY_AVAILABLE:
+        return
+
+    try:
+        project_id = get_project_id(state.project_path)
+
+        if not await memory_manager.memory_exists(project_id):
+            return
+
+        memory = await memory_manager.get_memory(project_id)
+
+        # Create session summary
+        changed_files = list(state.changed_files)[:10]
+        phase = state.phase
+        criteria_status = []
+
+        if state.scope and state.scope.acceptance_criteria:
+            for crit in state.scope.acceptance_criteria:
+                status = "done" if crit.get("fulfilled") else "open"
+                criteria_status.append(f"{crit.get('criterion', '?')}: {status}")
+
+        # Build learning content
+        learning_parts = [
+            f"Session: {scope_desc}",
+            f"Phase: {phase}",
+            f"Files changed: {', '.join(changed_files)}" if changed_files else "",
+        ]
+
+        if criteria_status:
+            learning_parts.append(f"Criteria: {'; '.join(criteria_status[:5])}")
+
+        learning_content = ". ".join([p for p in learning_parts if p])
+
+        if learning_content:
+            await memory.add(
+                content=learning_content,
+                collection="learnings",
+                metadata={
+                    "type": "session",
+                    "scope": scope_desc,
+                    "phase": phase,
+                    "files_count": len(changed_files),
+                }
+            )
+            logger.debug(f"Session learning consolidated: {scope_desc[:30]}")
+
+    except Exception as e:
+        logger.debug(f"Session consolidation failed: {e}")
+
+
+# =============================================================================
+# PHASE 3 HANDLERS (v5.3): AST Analysis, Architecture, Export/Import
+# =============================================================================
+
+@handler.register("chainguard_analyze_code")
+async def handle_analyze_code(args: Dict[str, Any]) -> List[TextContent]:
+    """Analyze code structure using AST parsing."""
+    working_dir = args.get("working_dir")
+    file_path = args.get("file", "")
+    state = await pm.get_async(working_dir)
+
+    try:
+        from .ast_analyzer import ast_analyzer, LANGUAGE_EXTENSIONS
+    except ImportError as e:
+        return _text(f"✗ AST Analyzer not available: {e}")
+
+    if not file_path:
+        return _text("✗ Missing required parameter: file")
+
+    # Build full path
+    full_path = Path(state.project_path) / file_path if not Path(file_path).is_absolute() else Path(file_path)
+
+    if full_path.is_dir():
+        # Directory analysis
+        analyses = ast_analyzer.analyze_directory(str(full_path))
+
+        if not analyses:
+            return _text(f"No analyzable files found in: {file_path}")
+
+        lines = [f"📊 **Code Analysis: {file_path}**", ""]
+        lines.append(f"Analyzed {len(analyses)} files")
+        lines.append("")
+
+        total_symbols = 0
+        for path, analysis in list(analyses.items())[:10]:  # Limit output
+            rel_path = str(Path(path).relative_to(full_path)) if full_path in Path(path).parents else path
+            symbols_summary = []
+            for s in analysis.symbols:
+                if s.type.value not in [t.value for t in symbols_summary]:
+                    symbols_summary.append(s.type)
+
+            types_str = ", ".join(s.value for s in symbols_summary[:3])
+            lines.append(f"├─ {rel_path}: {len(analysis.symbols)} symbols ({types_str})")
+            total_symbols += len(analysis.symbols)
+
+        if len(analyses) > 10:
+            lines.append(f"└─ ... and {len(analyses) - 10} more files")
+
+        lines.append("")
+        lines.append(f"**Total Symbols:** {total_symbols}")
+
+        return _text("\n".join(lines))
+
+    else:
+        # Single file analysis
+        if not full_path.exists():
+            return _text(f"✗ File not found: {file_path}")
+
+        ext = full_path.suffix.lower()
+        if ext not in LANGUAGE_EXTENSIONS:
+            return _text(f"✗ Unsupported file type: {ext}")
+
+        analysis = ast_analyzer.analyze_file(str(full_path))
+
+        lines = [f"📊 **Code Analysis: {full_path.name}**", ""]
+        lines.append(f"Language: {analysis.language}")
+        lines.append("")
+
+        if analysis.symbols:
+            lines.append(f"**Symbols ({len(analysis.symbols)}):**")
+            for symbol in analysis.symbols[:15]:
+                parent = f" (in {symbol.parent})" if symbol.parent else ""
+                lines.append(f"├─ {symbol.type.value}: {symbol.name}{parent} [L{symbol.line_start}]")
+            if len(analysis.symbols) > 15:
+                lines.append(f"└─ ... and {len(analysis.symbols) - 15} more")
+            lines.append("")
+
+        if analysis.imports:
+            lines.append(f"**Imports ({len(analysis.imports)}):**")
+            for imp in analysis.imports[:5]:
+                lines.append(f"├─ {imp[:60]}")
+            if len(analysis.imports) > 5:
+                lines.append(f"└─ ... and {len(analysis.imports) - 5} more")
+            lines.append("")
+
+        if analysis.relations:
+            lines.append(f"**Relations ({len(analysis.relations)}):**")
+            for rel in analysis.relations[:5]:
+                lines.append(f"├─ {rel.relation_type.value}: {', '.join(rel.symbols[:3])}")
+
+        return _text("\n".join(lines))
+
+
+@handler.register("chainguard_detect_architecture")
+async def handle_detect_architecture(args: Dict[str, Any]) -> List[TextContent]:
+    """Detect architectural patterns in the codebase."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+
+    try:
+        from .architecture import architecture_detector
+    except ImportError as e:
+        return _text(f"✗ Architecture Detector not available: {e}")
+
+    analysis = architecture_detector.analyze(state.project_path)
+
+    # v5.4: Store in Memory if available (always, even with low confidence)
+    memory_updated = False
+    if MEMORY_AVAILABLE:
+        try:
+            project_id = get_project_id(state.project_path)
+            if await memory_manager.memory_exists(project_id):
+                memory = await memory_manager.get_memory(project_id, state.project_path)
+
+                # Always store main architecture pattern
+                arch_content = (
+                    f"Project architecture: {analysis.pattern.value}. "
+                    f"Framework: {analysis.framework.value if analysis.framework else 'unknown'}. "
+                    f"Detected layers: {', '.join(analysis.detected_layers[:5]) if analysis.detected_layers else 'none'}. "
+                    f"Design patterns: {', '.join(analysis.detected_patterns[:5]) if analysis.detected_patterns else 'none'}."
+                )
+                await memory.upsert(
+                    content=arch_content,
+                    collection="architecture",
+                    metadata={
+                        "type": "architecture",
+                        "name": "project_architecture",
+                        "pattern": analysis.pattern.value,
+                        "framework": analysis.framework.value if analysis.framework else "",
+                        "confidence": analysis.confidence,
+                        "layers": ",".join(analysis.detected_layers[:10]) if analysis.detected_layers else "",
+                        "design_patterns": ",".join(analysis.detected_patterns[:10]) if analysis.detected_patterns else "",
+                    },
+                    doc_id="arch:main"
+                )
+                memory_updated = True
+
+                # Store each detected layer
+                for layer in analysis.detected_layers[:10]:
+                    layer_content = f"Architecture layer: {layer} in {analysis.pattern.value} pattern."
+                    await memory.upsert(
+                        content=layer_content,
+                        collection="architecture",
+                        metadata={
+                            "type": "layer",
+                            "name": layer,
+                            "pattern": analysis.pattern.value,
+                        },
+                        doc_id=f"arch:layer:{layer.lower()}"
+                    )
+
+                # Store design patterns
+                for pattern in analysis.detected_patterns[:10]:
+                    pattern_content = f"Design pattern: {pattern} detected in codebase."
+                    await memory.upsert(
+                        content=pattern_content,
+                        collection="architecture",
+                        metadata={
+                            "type": "design_pattern",
+                            "name": pattern,
+                        },
+                        doc_id=f"arch:pattern:{pattern.lower()}"
+                    )
+        except Exception:
+            pass  # Silent fail - architecture detection still works without memory
+
+    lines = [f"🏛️ **Architecture Analysis: {state.project_name}**", ""]
+
+    # Main pattern
+    lines.append(f"**Pattern:** {analysis.pattern.value}")
+    lines.append(f"**Confidence:** {analysis.confidence:.0%}")
+
+    if analysis.framework:
+        lines.append(f"**Framework:** {analysis.framework.value}")
+
+    lines.append("")
+
+    if analysis.detected_layers:
+        lines.append("**Detected Layers:**")
+        for layer in analysis.detected_layers[:8]:
+            lines.append(f"├─ {layer}")
+        lines.append("")
+
+    if analysis.detected_patterns:
+        lines.append("**Design Patterns:**")
+        for pattern in analysis.detected_patterns[:6]:
+            lines.append(f"├─ {pattern}")
+        lines.append("")
+
+    if analysis.suggestions:
+        lines.append("**Suggestions:**")
+        for suggestion in analysis.suggestions[:3]:
+            lines.append(f"• {suggestion}")
+
+    if memory_updated:
+        lines.append("")
+        lines.append("✓ Architecture stored in Memory")
+
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_memory_export")
+async def handle_memory_export(args: Dict[str, Any]) -> List[TextContent]:
+    """Export project memory to a portable file."""
+    if not MEMORY_AVAILABLE:
+        return _text("✗ Memory not available. Install: pip install chromadb sentence-transformers")
+
+    working_dir = args.get("working_dir")
+    export_format = args.get("format", "json")
+    collections = args.get("collections")
+    include_embeddings = args.get("include_embeddings", False)
+    compress = args.get("compress", False)
+
+    state = await pm.get_async(working_dir)
+    project_id = get_project_id(state.project_path)
+
+    if not await memory_manager.memory_exists(project_id):
+        return _text("✗ No memory initialized for this project. Run chainguard_memory_init() first.")
+
+    try:
+        from .memory_export import memory_exporter
+    except ImportError as e:
+        return _text(f"✗ Memory Export not available: {e}")
+
+    memory = await memory_manager.get_memory(project_id, state.project_path)
+
+    if export_format == "jsonl":
+        result = await memory_exporter.export_jsonl(
+            memory,
+            collections=collections,
+            include_embeddings=include_embeddings,
+            compress=compress,
+        )
+    else:
+        result = await memory_exporter.export_json(
+            memory,
+            collections=collections,
+            include_embeddings=include_embeddings,
+            compress=compress,
+        )
+
+    if result.success:
+        lines = ["✓ Memory exported successfully!", ""]
+        lines.append(f"**File:** {result.file_path}")
+        lines.append(f"**Documents:** {result.documents_exported}")
+        lines.append(f"**Collections:** {', '.join(result.collections_exported)}")
+        return _text("\n".join(lines))
+    else:
+        return _text(f"✗ Export failed: {result.error}")
+
+
+@handler.register("chainguard_memory_import")
+async def handle_memory_import(args: Dict[str, Any]) -> List[TextContent]:
+    """Import project memory from an exported file."""
+    if not MEMORY_AVAILABLE:
+        return _text("✗ Memory not available. Install: pip install chromadb sentence-transformers")
+
+    working_dir = args.get("working_dir")
+    file_path = args.get("file", "")
+    merge = args.get("merge", True)
+    skip_existing = args.get("skip_existing", True)
+
+    if not file_path:
+        return _text("✗ Missing required parameter: file")
+
+    state = await pm.get_async(working_dir)
+    project_id = get_project_id(state.project_path)
+
+    try:
+        from .memory_export import memory_importer
+    except ImportError as e:
+        return _text(f"✗ Memory Import not available: {e}")
+
+    # Ensure memory exists
+    if not await memory_manager.memory_exists(project_id):
+        # Initialize first
+        memory = await memory_manager.get_memory(project_id, state.project_path)
+    else:
+        memory = await memory_manager.get_memory(project_id, state.project_path)
+
+    # Determine format from extension
+    path = Path(file_path)
+    is_jsonl = ".jsonl" in path.name
+
+    if is_jsonl:
+        result = await memory_importer.import_jsonl(
+            memory,
+            file_path,
+            merge=merge,
+            skip_existing=skip_existing,
+        )
+    else:
+        result = await memory_importer.import_json(
+            memory,
+            file_path,
+            merge=merge,
+            skip_existing=skip_existing,
+        )
+
+    if result.success:
+        lines = ["✓ Memory imported successfully!", ""]
+        lines.append(f"**Imported:** {result.documents_imported} documents")
+        lines.append(f"**Skipped:** {result.documents_skipped}")
+        lines.append(f"**Collections:** {', '.join(result.collections_imported)}")
+        return _text("\n".join(lines))
+    else:
+        return _text(f"✗ Import failed: {result.error}")
+
+
+@handler.register("chainguard_list_exports")
+async def handle_list_exports(args: Dict[str, Any]) -> List[TextContent]:
+    """List available memory export files."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+
+    try:
+        from .memory_export import list_exports
+    except ImportError as e:
+        return _text(f"✗ Memory Export not available: {e}")
+
+    project_id = get_project_id(state.project_path) if MEMORY_AVAILABLE else None
+    exports = list_exports(project_id[:8] if project_id else None)
+
+    if not exports:
+        return _text("No export files found.")
+
+    lines = ["📁 **Available Exports:**", ""]
+
+    for exp in exports[:10]:
+        size_kb = exp["size_bytes"] / 1024
+        lines.append(f"├─ {exp['filename']}")
+        lines.append(f"│  Size: {size_kb:.1f} KB | Modified: {exp['modified'][:16]}")
+
+    if len(exports) > 10:
+        lines.append(f"└─ ... and {len(exports) - 10} more files")
+
+    return _text("\n".join(lines))
+
+
+# =============================================================================
+# MAIN ENTRY POINT (backwards compatibility)
+# =============================================================================
+
+async def handle_tool_call(name: str, args: Dict[str, Any]) -> List[TextContent]:
+    """Handle a tool call - delegates to HandlerRegistry."""
+    return await HandlerRegistry.dispatch(name, args)

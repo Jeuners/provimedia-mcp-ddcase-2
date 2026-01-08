@@ -1,0 +1,36 @@
+# =============================================================================
+# CHAINGUARD - Python Dependencies
+# =============================================================================
+# Installation: pip3 install -r requirements.txt
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Erforderliche Abhängigkeiten
+# -----------------------------------------------------------------------------
+
+# MCP (Model Context Protocol) - Kern-Framework für Claude Code Integration
+mcp>=0.9.0
+
+# -----------------------------------------------------------------------------
+# Optionale Abhängigkeiten
+# -----------------------------------------------------------------------------
+
+# YAML-Unterstützung für Scope-Dateien und Konfiguration
+pyyaml>=6.0
+
+# Anthropic SDK für Deep-Validator (LLM-basierte Validierung)
+# Nur erforderlich wenn deep-validator.py genutzt wird
+anthropic>=0.18.0
+
+# -----------------------------------------------------------------------------
+# Entwickler-Abhängigkeiten (nur für Entwicklung)
+# -----------------------------------------------------------------------------
+
+# Typ-Prüfung
+# mypy>=1.0.0
+
+# Code-Formatierung
+# black>=23.0.0
+
+# Linting
+# ruff>=0.1.0

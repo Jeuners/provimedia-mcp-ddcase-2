@@ -1,0 +1,66 @@
+# =============================================================================
+# CHAINGUARD SCOPE DEFINITION
+# =============================================================================
+# Lege diese Datei im Projekt-Root ab als: .chainguard/scope.yaml
+# Oder setze den Scope per MCP-Tool: chainguard_set_scope
+# =============================================================================
+
+# Kurze Beschreibung was gebaut werden soll
+description: "Implementierung eines User-Authentication-Systems mit Login, Logout und Passwort-Reset"
+
+# Welche Module/Bereiche sind betroffen?
+modules:
+  - "app/Http/Controllers/AuthController.php"
+  - "app/Models/User.php"
+  - "resources/views/auth/*.blade.php"
+  - "routes/web.php"
+  - "database/migrations/*users*.php"
+
+# Welche Tests werden erwartet?
+expected_tests:
+  - "tests/Feature/AuthenticationTest.php"
+  - "tests/Feature/PasswordResetTest.php"
+  - "tests/Unit/UserTest.php"
+
+# Akzeptanzkriterien - was muss am Ende funktionieren?
+acceptance_criteria:
+  - "User kann sich registrieren"
+  - "User kann sich einloggen"
+  - "User kann sich ausloggen"
+  - "User kann Passwort zurücksetzen"
+  - "Alle Routen sind in web.php registriert"
+  - "Alle Views existieren und sind erreichbar"
+  - "Tests laufen durch"
+
+# Was soll bei der Validierung ignoriert werden?
+excluded_from_validation:
+  - "node_modules/*"
+  - "vendor/*"
+  - "storage/*"
+  - ".env"
+
+# Zusätzliche Hinweise für den Validator
+notes: |
+  - Verwendung von Laravel Breeze oder Fortify ist akzeptabel
+  - Email-Verifizierung ist optional
+  - 2FA ist nicht Teil des Scopes
+
+# Phasen-Definition (optional)
+phases:
+  - name: "Setup"
+    tasks:
+      - "Migrations erstellen"
+      - "Model erstellen"
+  - name: "Backend"
+    tasks:
+      - "Controller implementieren"
+      - "Routen registrieren"
+  - name: "Frontend"
+    tasks:
+      - "Views erstellen"
+      - "Forms implementieren"
+  - name: "Testing"
+    tasks:
+      - "Unit Tests"
+      - "Feature Tests"
+      - "Manueller Test"

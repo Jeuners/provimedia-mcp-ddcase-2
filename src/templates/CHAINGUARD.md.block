@@ -1,0 +1,60 @@
+<!-- CHAINGUARD-MANDATORY-START v5.3.0 -->
+
+# ================================================
+# STOP - LIES DAS ZUERST!
+# ================================================
+#
+# BEVOR DU IRGENDETWAS ANDERES TUST:
+#
+#     chainguard_set_scope(
+#         description="...",
+#         working_dir="...",
+#         acceptance_criteria=[...]
+#     )
+#
+# ALLE anderen Chainguard-Tools sind BLOCKIERT
+# bis du set_scope aufgerufen hast!
+#
+# v5.3: HARD ENFORCEMENT + Task-Mode System
+# BLOCKIERT wenn DB-Schema nicht geprüft wurde!
+#
+# ================================================
+
+## CHAINGUARD v5.3 - PFLICHT-ANWEISUNGEN (HARD ENFORCEMENT!)
+
+| # | PFLICHT-AKTION | WANN |
+|---|----------------|------|
+| 1 | `chainguard_set_scope(...)` | **ALLERERSTE AKTION bei jedem Task!** |
+| 2 | `chainguard_db_connect() + chainguard_db_schema()` | **VOR jeder DB/Schema-Arbeit! (BLOCKIERT sonst!)** |
+| 3 | `chainguard_track(file="...", ctx="...")` | Nach JEDER Dateiänderung |
+| 4 | `chainguard_test_endpoint(...)` | **Bei Web-Projekten: VOR finish!** |
+| 5 | `chainguard_finish(confirmed=True)` | Am Task-Ende |
+
+> **v5.3 Features:** Task-Mode System, Long-Term Memory, AST-Analyse, Architektur-Erkennung
+
+### Minimaler Workflow
+
+```python
+# 1. ZUERST - Scope setzen (PFLICHT!)
+chainguard_set_scope(description="Was du baust", working_dir="/pfad")
+
+# 2. BEI DB-ARBEIT - Schema prüfen (BLOCKIERT SONST!)
+chainguard_db_connect(host="localhost", user="root", password="...", database="mydb")
+chainguard_db_schema()  # Zeigt alle Tabellen + Spalten!
+
+# 3. Arbeiten + Tracken
+# ... Edit/Write ...
+chainguard_track(file="...", ctx="...")
+
+# 4. Bei Web-Projekten (PHP/JS/TS): HTTP-Tests!
+chainguard_set_base_url(base_url="http://localhost:8888/app")
+chainguard_test_endpoint(url="/geänderte-route", method="GET")
+
+# 5. Abschliessen
+chainguard_finish(confirmed=True)
+```
+
+### Context-Canary: `ctx="..."`
+
+Bei JEDEM Chainguard-Aufruf `ctx="..."` mitgeben! Fehlt er -> Kontext verloren -> Auto-Refresh.
+<!-- CHAINGUARD-MANDATORY-END -->
