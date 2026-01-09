@@ -12,7 +12,7 @@ See LICENSE file in the project root for full license information.
 import asyncio
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, List, Callable, Awaitable
+from typing import Dict, Any, List, Callable, Awaitable, Set
 
 try:
     from mcp.types import TextContent
@@ -30,6 +30,7 @@ from .config import (
     XML_RESPONSES_ENABLED,
     TOON_ENABLED,
     MEMORY_ENABLED,
+    SYMBOL_VALIDATION_AUTO,
     logger
 )
 
@@ -47,6 +48,9 @@ from .xml_response import (
 from .models import ScopeDefinition
 from .project_manager import project_manager as pm
 from .validators import SyntaxValidator
+from .symbol_validator import SymbolValidator, SymbolExtractor, SymbolValidationMode
+from .symbol_patterns import detect_language
+from .package_validator import PackageValidator, format_package_report
 from .utils import sanitize_path, is_path_safe
 from .checklist import ChecklistRunner
 from .analyzers import CodeAnalyzer, ImpactAnalyzer
@@ -482,6 +486,44 @@ async def handle_track(args: Dict[str, Any]) -> List[TextContent]:
             )
             if similar:
                 messages.append(format_auto_suggest(similar))
+
+    # v6.2: Symbol Validation - check for hallucinated function calls
+    run_symbol_validation = (
+        SYMBOL_VALIDATION_AUTO and
+        file and
+        action != "delete" and
+        task_mode == TaskMode.PROGRAMMING and
+        SymbolValidator.get_mode() != SymbolValidationMode.OFF
+    )
+
+    if run_symbol_validation:
+        try:
+            # Read file content
+            full_path = Path(state.project_path) / file
+            if full_path.exists():
+                file_content = full_path.read_text(encoding='utf-8', errors='replace')
+
+                # Collect known symbols from project (cached per language)
+                lang = detect_language(str(full_path))
+                if lang:
+                    known_symbols = await _get_project_symbols(state.project_path, lang)
+
+                    # Validate
+                    symbol_result = SymbolValidator.validate(file_content, file, known_symbols)
+
+                    # Report issues (WARN mode = inform only, never block)
+                    if symbol_result.issues:
+                        high_conf = [i for i in symbol_result.issues if i.confidence > 0.7]
+                        if high_conf:
+                            messages.append("")
+                            messages.append(f"⚠️ Symbol-Check: {len(high_conf)} potenzielle Halluzinationen")
+                            for issue in high_conf[:3]:  # Max 3 shown
+                                messages.append(f"   [{issue.confidence:.0%}] {issue.name}() - Line {issue.line}")
+                            if len(high_conf) > 3:
+                                messages.append(f"   ... und {len(high_conf) - 3} weitere")
+                            messages.append("   → Prüfe ob diese Funktionen existieren")
+        except Exception as e:
+            logger.debug(f"Symbol validation skipped: {e}")
 
     # Check scope
     sanitized = sanitize_path(file, state.project_path) if file else ""
@@ -3790,6 +3832,60 @@ def _extract_functions(content: str, suffix: str, file_path: str = "") -> list:
 
 
 # =============================================================================
+# SYMBOL VALIDATION HELPERS (v6.2)
+# =============================================================================
+
+# Cache for project symbols (per project_path + language)
+_symbol_cache: Dict[str, Set[str]] = {}
+_symbol_cache_time: Dict[str, float] = {}
+SYMBOL_CACHE_TTL = 300  # 5 minutes
+
+async def _get_project_symbols(project_path: str, lang) -> Set[str]:
+    """
+    Get all symbol definitions from the project for a given language.
+    Results are cached for 5 minutes to avoid repeated scans.
+    """
+    import time
+    from .symbol_patterns import EXTENSION_MAP
+
+    cache_key = f"{project_path}:{lang.value if hasattr(lang, 'value') else lang}"
+    now = time.time()
+
+    # Check cache
+    if cache_key in _symbol_cache:
+        if now - _symbol_cache_time.get(cache_key, 0) < SYMBOL_CACHE_TTL:
+            return _symbol_cache[cache_key]
+
+    # Collect symbols
+    symbols = set()
+    extractor = SymbolExtractor()
+    project = Path(project_path)
+
+    # Get extensions for this language
+    extensions = [ext for ext, l in EXTENSION_MAP.items() if l == lang]
+
+    # Scan project files
+    for ext in extensions:
+        for src_file in project.glob(f"**/*{ext}"):
+            # Skip common directories
+            if any(skip in str(src_file) for skip in ['node_modules', 'vendor', '.git', '__pycache__', 'dist', 'build']):
+                continue
+
+            try:
+                content = src_file.read_text(encoding='utf-8', errors='replace')
+                defs = extractor.extract_definitions(content, lang)
+                symbols.update(defs)
+            except Exception:
+                pass
+
+    # Cache result
+    _symbol_cache[cache_key] = symbols
+    _symbol_cache_time[cache_key] = now
+
+    return symbols
+
+
+# =============================================================================
 # MEMORY AUTO-UPDATE HELPERS (v5.2)
 # =============================================================================
 
@@ -4509,6 +4605,151 @@ async def handle_list_exports(args: Dict[str, Any]) -> List[TextContent]:
         ))
 
     return _text("\n".join(lines))
+
+
+# =============================================================================
+# SYMBOL VALIDATION TOOLS (v6.2 - Hallucination Prevention)
+# =============================================================================
+
+@handler.register("chainguard_symbol_mode")
+async def handle_symbol_mode(args: Dict[str, Any]) -> List[TextContent]:
+    """Set or view symbol validation mode."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    mode = args.get("mode")
+
+    if mode:
+        # Set new mode
+        try:
+            new_mode = SymbolValidationMode(mode.upper())
+            SymbolValidator.set_mode(new_mode)
+
+            mode_descriptions = {
+                SymbolValidationMode.OFF: "Symbol validation disabled",
+                SymbolValidationMode.WARN: "Warnings only (no blocking)",
+                SymbolValidationMode.STRICT: "Block on high-confidence issues",
+                SymbolValidationMode.ADAPTIVE: "Auto-adjust based on false positive rate"
+            }
+
+            return _text(f"✓ Symbol validation mode: {new_mode.value}\n  {mode_descriptions[new_mode]}")
+
+        except ValueError:
+            valid_modes = ", ".join([m.value for m in SymbolValidationMode])
+            return _text(f"✗ Invalid mode '{mode}'. Valid modes: {valid_modes}")
+
+    # Show current mode
+    current_mode = SymbolValidator.get_mode()
+
+    mode_info = {
+        SymbolValidationMode.OFF: ("⬚", "Disabled"),
+        SymbolValidationMode.WARN: ("⚠", "Warnings only (default)"),
+        SymbolValidationMode.STRICT: ("🛡", "Strict (blocking)"),
+        SymbolValidationMode.ADAPTIVE: ("🔄", "Adaptive")
+    }
+
+    icon, desc = mode_info.get(current_mode, ("?", "Unknown"))
+
+    lines = [
+        f"Symbol Validation: {icon} {current_mode.value}",
+        f"  {desc}",
+        "",
+        "Available modes:",
+        "  OFF     - Disabled",
+        "  WARN    - Warnings only (default, never blocks)",
+        "  STRICT  - Block on high-confidence issues",
+        "  ADAPTIVE - Auto-adjust"
+    ]
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_validate_symbols")
+async def handle_validate_symbols(args: Dict[str, Any]) -> List[TextContent]:
+    """Validate symbols in a file against the codebase."""
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    file_path = args.get("file")
+    code = args.get("code")
+
+    if not file_path and not code:
+        return _text("✗ Either 'file' or 'code' parameter required")
+
+    # Get code content
+    if file_path:
+        full_path = Path(state.project_path) / file_path
+        if not full_path.exists():
+            return _text(f"✗ File not found: {file_path}")
+
+        try:
+            code = full_path.read_text(encoding='utf-8', errors='replace')
+        except Exception as e:
+            return _text(f"✗ Cannot read file: {e}")
+
+    # Get known symbols from codebase
+    lang = detect_language(file_path or "code.py")
+    if not lang:
+        return _text("✗ Could not detect language")
+
+    known_symbols = await _get_project_symbols(state.project_path, lang)
+
+    # Validate the target code
+    result = SymbolValidator.validate(code, file_path or "inline.txt", known_symbols)
+
+    if not result.issues:
+        return _text(f"✓ No symbol issues detected in {file_path or 'code'}")
+
+    # Format issues
+    lines = [f"Symbol Validation: {len(result.issues)} potential issues", ""]
+
+    for issue in result.issues[:10]:  # Limit to 10
+        conf_bar = "█" * int(issue.confidence * 5) + "░" * (5 - int(issue.confidence * 5))
+        lines.append(f"  [{conf_bar}] {issue.name}")
+        lines.append(f"      Line {issue.line}: {issue.reason}")
+
+    if len(result.issues) > 10:
+        lines.append(f"  ... and {len(result.issues) - 10} more")
+
+    lines.append("")
+    lines.append(f"Overall confidence: {result.confidence:.0%}")
+    lines.append(f"Should block: {'Yes' if result.should_block else 'No'}")
+
+    return _text("\n".join(lines))
+
+
+@handler.register("chainguard_validate_packages")
+async def handle_validate_packages(args: Dict[str, Any]) -> List[TextContent]:
+    """Validate package imports against project dependencies.
+
+    Detects hallucinated/slopsquatting packages that don't exist in:
+    - composer.json (PHP)
+    - package.json (JS/TS)
+    - requirements.txt (Python)
+
+    Args:
+        file: File path to validate (optional if code is provided)
+        code: Source code to validate (optional if file is provided)
+        working_dir: Project root directory
+    """
+    working_dir = args.get("working_dir")
+    state = await pm.get_async(working_dir)
+    file_path = args.get("file")
+    code = args.get("code")
+
+    if not file_path and not code:
+        return _text("✗ Either 'file' or 'code' parameter required")
+
+    validator = PackageValidator(state.project_path)
+
+    if file_path:
+        full_path = Path(state.project_path) / file_path
+        result = validator.validate_file(str(full_path))
+    else:
+        # Detect language from file extension or default to JS
+        lang = detect_language(file_path or "code.js")
+        if not lang:
+            return _text("✗ Could not detect language. Provide a file path.")
+        result = validator.validate_content(code, file_path or "inline.txt", lang)
+
+    return _text(format_package_report(result))
 
 
 # =============================================================================

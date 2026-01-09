@@ -158,6 +158,23 @@ from .test_runner import TestRunner, TestConfig, TestResult
 from .history import HistoryManager, HistoryEntry, ErrorEntry, format_auto_suggest
 from .db_inspector import DBInspector, DBConfig, get_inspector, clear_inspector
 
+# Hallucination Prevention (v6.1)
+from .symbol_validator import (
+    SymbolValidator, SymbolExtractor, SymbolValidationMode,
+    SymbolIssue, ValidationResult, AdaptiveSymbolValidation,
+    format_issues_report
+)
+from .symbol_patterns import (
+    Language, EXTENSION_MAP, BUILTINS, COMMON_EXTERNAL_NAMES,
+    detect_language, is_builtin, is_common_external, has_dynamic_patterns
+)
+from .package_validator import (
+    PackageValidator, PackageIssue, PackageValidationResult,
+    ImportExtractor, PackageRegistry,
+    levenshtein_distance, find_similar_packages, format_package_report,
+    PYTHON_STDLIB, NODE_BUILTINS, PHP_BUILTINS
+)
+
 # Memory imports are optional (require 'chromadb' and 'sentence-transformers' packages)
 try:
     from .memory import (
@@ -414,6 +431,37 @@ __all__ = [
     "FileSummary",
     "FunctionInfo",
     "ClassInfo",
+
+    # Hallucination Prevention (v6.1)
+    # Symbol Validator
+    "SymbolValidator",
+    "SymbolExtractor",
+    "SymbolValidationMode",
+    "SymbolIssue",
+    "ValidationResult",
+    "AdaptiveSymbolValidation",
+    "format_issues_report",
+    # Symbol Patterns
+    "Language",
+    "EXTENSION_MAP",
+    "BUILTINS",
+    "COMMON_EXTERNAL_NAMES",
+    "detect_language",
+    "is_builtin",
+    "is_common_external",
+    "has_dynamic_patterns",
+    # Package Validator (Slopsquatting Detection)
+    "PackageValidator",
+    "PackageIssue",
+    "PackageValidationResult",
+    "ImportExtractor",
+    "PackageRegistry",
+    "levenshtein_distance",
+    "find_similar_packages",
+    "format_package_report",
+    "PYTHON_STDLIB",
+    "NODE_BUILTINS",
+    "PHP_BUILTINS",
 
     # Server
     "main",

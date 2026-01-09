@@ -167,7 +167,7 @@ cp -r src/mcp-server/chainguard ~/.chainguard/
 
 ---
 
-## Modulstruktur (v6.0.0)
+## Modulstruktur (v6.1.0)
 
 Das Chainguard MCP Server Package besteht aus folgenden Modulen:
 
@@ -216,6 +216,14 @@ Das Chainguard MCP Server Package besteht aus folgenden Modulen:
 | Modul | Zweck |
 |-------|-------|
 | `xml_response.py` | XML Response System - strukturierte XML-Ausgabe für bessere Claude-Comprehension |
+| `toon.py` | TOON Encoder - Token-Oriented Object Notation für 30-60% weniger Tokens |
+
+### Phase 6 Features (v6.1+)
+| Modul | Zweck |
+|-------|-------|
+| `symbol_validator.py` | Halluzinationsprävention - Erkennt falsche Funktionsaufrufe |
+| `symbol_patterns.py` | Regex-Patterns für 7 Sprachen (PHP, JS, TS, Python, C#, Go, Rust) |
+| `package_validator.py` | Slopsquatting-Detection - Erkennt halluzinierte Package-Imports |
 
 ### Utilities
 | Modul | Zweck |

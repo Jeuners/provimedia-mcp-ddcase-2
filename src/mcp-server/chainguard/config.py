@@ -21,7 +21,7 @@ from typing import Dict, Set, Union, List, Any
 # =============================================================================
 # Version
 # =============================================================================
-VERSION = "6.0.0"
+VERSION = "6.1.0"
 
 
 # =============================================================================
@@ -38,6 +38,11 @@ TOON_ENABLED = True
 # WARNING: Can cause high RAM usage (1-2GB+) and kernel panics on low-memory systems!
 # Set to False to disable even if dependencies are installed
 MEMORY_ENABLED = False
+
+# Symbol Validation (v6.2): Automatic hallucination detection in chainguard_track
+# Checks function calls against known definitions in codebase
+# Only runs in programming mode, WARN mode = inform only, never block
+SYMBOL_VALIDATION_AUTO = True
 
 
 # =============================================================================

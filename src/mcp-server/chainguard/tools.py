@@ -774,5 +774,79 @@ Examples:
                 },
                 "required": []
             }
+        ),
+
+        # HALLUCINATION PREVENTION: Symbol Validation
+        Tool(
+            name="chainguard_symbol_mode",
+            description="""Set or view symbol validation mode (Hallucination Prevention).
+
+Modes:
+- OFF: Disable symbol validation entirely
+- WARN: Show warnings but never block (DEFAULT - safe for production)
+- STRICT: Block on high-confidence hallucinated symbols
+- ADAPTIVE: Auto-adjust based on false positive rate
+
+Use WARN (default) for normal work. Switch to OFF if you encounter too many false positives.
+STRICT is only recommended when you need maximum protection against hallucinated code.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["OFF", "WARN", "STRICT", "ADAPTIVE"], "description": "Validation mode to set (omit to view current mode)"},
+                    "working_dir": {"type": "string"}
+                },
+                "required": []
+            }
+        ),
+
+        Tool(
+            name="chainguard_validate_symbols",
+            description="""Validate symbols in code against the codebase (Hallucination Prevention).
+
+Checks for potentially hallucinated function/method calls by comparing:
+- Function calls in the code against known definitions in the project
+- Built-in functions for each language (PHP, JS, TS, Python, C#, Go, Rust)
+- Common external library patterns
+
+Returns confidence scores for each potential issue. High confidence (>0.8) suggests
+likely hallucination. Low confidence may be false positives (external APIs, dynamic code).""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "File path to validate (relative to project)"},
+                    "code": {"type": "string", "description": "Code to validate (alternative to file)"},
+                    "working_dir": {"type": "string"}
+                },
+                "required": []
+            }
+        ),
+
+        # HALLUCINATION PREVENTION: Package Validation (Slopsquatting Detection)
+        Tool(
+            name="chainguard_validate_packages",
+            description="""Validate package imports against project dependencies (Slopsquatting Detection).
+
+Research shows ~20% of LLM-recommended packages don't exist! Attackers register
+these hallucinated package names ("slopsquatting") to distribute malware.
+
+Validates imports against:
+- composer.json / composer.lock (PHP)
+- package.json / node_modules (JavaScript/TypeScript)
+- requirements.txt / pyproject.toml (Python)
+
+Features:
+- Typo detection using Levenshtein distance
+- Slopsquatting warnings for similar package names
+- Standard library whitelisting (Node builtins, Python stdlib, PHP classes)
+- Confidence scoring for each issue""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "File path to validate (relative to project)"},
+                    "code": {"type": "string", "description": "Code to validate (alternative to file)"},
+                    "working_dir": {"type": "string"}
+                },
+                "required": []
+            }
         )
     ]

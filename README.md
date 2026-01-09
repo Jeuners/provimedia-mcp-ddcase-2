@@ -27,6 +27,20 @@
 - **Optimized for Arrays** - Best for lists of files, tables, history entries
 - **Automatic Formatting** - Tools like `chainguard_projects`, `chainguard_history` use TOON by default
 
+### Hallucination Prevention (v6.1+)
+- **Symbol Validation** - Detects hallucinated function/method calls with confidence scoring
+- **Slopsquatting Detection** - Catches typosquatted package names (e.g., `requets` instead of `requests`)
+- **7-Language Support** - PHP, JavaScript, TypeScript, Python, C#, Go, Rust
+- **Package Registry Validation** - Checks imports against composer.json, package.json, requirements.txt
+- **Adaptive Mode** - Auto-adjusts sensitivity based on false positive rate
+
+| Mode | Behavior |
+|------|----------|
+| `OFF` | Disable validation |
+| `WARN` | Show warnings only (default) |
+| `STRICT` | Block high-confidence issues |
+| `ADAPTIVE` | Auto-adjust based on FP rate |
+
 ### Deep Logic Summaries (v5.4)
 - **Code Understanding** - Extracts human-readable summaries of what code actually does
 - **Purpose Inference** - Recognizes patterns from docstrings, comments, and naming conventions
@@ -160,6 +174,13 @@ chainguard_db_schema()
 | `chainguard_analyze_code` | AST-based code analysis |
 | `chainguard_detect_architecture` | Detect architecture patterns |
 
+### Hallucination Prevention Tools
+| Tool | Description |
+|------|-------------|
+| `chainguard_symbol_mode` | Set symbol validation mode (OFF/WARN/STRICT/ADAPTIVE) |
+| `chainguard_validate_symbols` | Validate function/method calls against codebase |
+| `chainguard_validate_packages` | Validate imports against project dependencies |
+
 ### Database Tools
 | Tool | Description |
 |------|-------------|
@@ -178,12 +199,15 @@ chainguard_db_schema()
 
 ```
 ~/.chainguard/
-├── chainguard/           # MCP Server Package (20 modules)
+├── chainguard/           # MCP Server Package (23 modules)
 │   ├── handlers.py       # Tool handlers
 │   ├── memory.py         # Long-Term Memory
 │   ├── code_summarizer.py # Deep Logic Extraction
 │   ├── ast_analyzer.py   # AST Analysis
 │   ├── architecture.py   # Pattern Detection
+│   ├── symbol_validator.py # Hallucination Prevention
+│   ├── symbol_patterns.py  # Language-specific patterns
+│   ├── package_validator.py # Slopsquatting Detection
 │   └── ...
 ├── chainguard_mcp.py     # MCP Entry Point
 ├── hooks/                # Claude Code Hooks
@@ -230,7 +254,10 @@ python3 -m pytest tests/ -v
 | Analyzers | 46 |
 | Memory System | 103 |
 | Code Summarizer | 45 |
-| **Total** | **605+** |
+| TOON Encoder | 63 |
+| Hallucination Prevention | 71 |
+| Symbol Validation | 47 |
+| **Total** | **1111+** |
 
 ## Contributing
 
@@ -264,10 +291,15 @@ Created and maintained by **[Provimedia GmbH](https://provimedia.de)**
 ## Changelog
 
 ### v6.1.0
+- **Hallucination Prevention** - Detects LLM-hallucinated function calls and package imports
+  - `chainguard_validate_symbols` - Validates function/method calls against codebase
+  - `chainguard_validate_packages` - Slopsquatting detection for typosquatted packages
+  - 7-language support: PHP, JavaScript, TypeScript, Python, C#, Go, Rust
+  - Adaptive mode auto-adjusts based on false positive rate
 - **Scope Reminder Hook** - New UserPromptSubmit hook that reminds to set scope
 - Fixes the gap where pure analysis tasks (Task/Explore) could bypass scope enforcement
 - 30-minute cooldown to prevent spam
-- Skips short/conversational prompts automatically
+- 118 new tests (symbol_validation: 47, package_validator: 71)
 
 ### v6.0.0
 - **TOON Encoder** - Token-Oriented Object Notation for 30-60% token savings
