@@ -1,4 +1,4 @@
-<!-- CHAINGUARD-MANDATORY-START v5.3.0 -->
+<!-- CHAINGUARD-MANDATORY-START v6.0.0 -->
 
 # ================================================
 # STOP - LIES DAS ZUERST!
@@ -15,12 +15,12 @@
 # ALLE anderen Chainguard-Tools sind BLOCKIERT
 # bis du set_scope aufgerufen hast!
 #
-# v5.3: HARD ENFORCEMENT + Task-Mode System
+# v6.0: TOON Token-Optimierung + Task-Mode System
 # BLOCKIERT wenn DB-Schema nicht geprüft wurde!
 #
 # ================================================
 
-## CHAINGUARD v5.3 - PFLICHT-ANWEISUNGEN (HARD ENFORCEMENT!)
+## CHAINGUARD v6.0 - PFLICHT-ANWEISUNGEN (HARD ENFORCEMENT!)
 
 | # | PFLICHT-AKTION | WANN |
 |---|----------------|------|
@@ -30,7 +30,7 @@
 | 4 | `chainguard_test_endpoint(...)` | **Bei Web-Projekten: VOR finish!** |
 | 5 | `chainguard_finish(confirmed=True)` | Am Task-Ende |
 
-> **v5.3 Features:** Task-Mode System, Long-Term Memory, AST-Analyse, Architektur-Erkennung
+> **v6.0 Features:** TOON Token-Optimierung (30-60% Ersparnis), Task-Mode System, Long-Term Memory (optional)
 
 ### Minimaler Workflow
 
@@ -84,7 +84,7 @@ Bei JEDEM Chainguard-Aufruf `ctx="..."` mitgeben! Fehlt er -> Kontext verloren -
 
 
 
-# CHAINGUARD v5.0.0 - Task-Mode System + Hard Enforcement
+# CHAINGUARD v6.0.0 - TOON Token-Optimierung + Task-Mode System
 
 > **🔴 WICHTIG - Modulare Struktur:**
 > Der MCP-Server läuft von `~/.chainguard/` - NICHT aus diesem Projekt!
@@ -121,6 +121,7 @@ Bei JEDEM Chainguard-Aufruf `ctx="..."` mitgeben! Fehlt er -> Kontext verloren -
     ├── cache.py           (LRU + TTL-LRU Cache)
     ├── checklist.py       (Async Checklist-Ausführung)
     ├── config.py          (Konstanten)
+    ├── toon.py            (TOON Encoder, v6.0)
     └── utils.py           (Hilfsfunktionen)
 ```
 
@@ -151,16 +152,60 @@ python3 -m pytest tests/test_cache.py -v
 | `test_history.py` | HistoryManager, ErrorEntry, Auto-Suggest | 29 |
 | `test_db_inspector.py` | DBConfig, DBInspector, SchemaInfo | 26 |
 | `test_task_mode.py` | TaskMode, ModeFeatures, Auto-Detection | 32 |
+| `test_toon.py` | TOON Encoder, Token-Savings, Array-Formatting | 63 |
 
 **Checkliste für neue Features:**
 1. Neues Modul? → Neue `tests/test_<module>.py` erstellen
 2. Neue Klasse/Funktion? → Tests in bestehende Datei hinzufügen
 3. Bug-Fix? → Regression-Test hinzufügen
-4. **Alle 399 Tests müssen grün sein vor Sync!**
+4. **Alle 764+ Tests müssen grün sein vor Sync!**
 
 Siehe **[docs/TESTING.md](docs/TESTING.md)** für vollständige Dokumentation.
 
-## v5.0.0 Features (NEU!)
+## v6.0.0 Features (NEU!)
+
+### TOON - Token-Oriented Object Notation
+
+TOON ist ein kompaktes Datenformat speziell für LLM-Input, das **30-60% weniger Tokens** verbraucht als JSON.
+
+**Vorher (JSON-style):**
+```json
+[{"id":"abc","path":"/app","phase":"impl","files":5},{"id":"def","path":"/other","phase":"plan","files":3}]
+```
+
+**Nachher (TOON):**
+```
+projects[2]{id,path,phase,files}:
+  abc,/app,impl,5
+  def,/other,plan,3
+```
+
+**Aktivierte Tools:**
+| Tool | Format | Token-Ersparnis |
+|------|--------|-----------------|
+| `chainguard_projects` | TOON | ~40% |
+| `chainguard_history` | TOON | ~40% |
+
+**Feature Flags (config.py):**
+```python
+TOON_ENABLED = True        # TOON für Array-Outputs (default: an)
+MEMORY_ENABLED = False     # Long-Term Memory (default: aus wegen RAM)
+XML_RESPONSES_ENABLED = False  # XML-Responses (default: aus)
+```
+
+### Memory standardmäßig deaktiviert
+
+Long-Term Memory (ChromaDB + sentence-transformers) kann **1-2GB RAM** verbrauchen und auf Systemen mit wenig Speicher zu Problemen führen. Daher ist `MEMORY_ENABLED = False` der neue Default.
+
+**Aktivieren (nur bei genug RAM):**
+```python
+# In ~/.chainguard/chainguard/config.py:
+MEMORY_ENABLED = True
+```
+
+---
+
+## v5.0.0 Features
 
 ### Task-Mode System - Flexibel für alle Aufgaben!
 
@@ -829,19 +874,17 @@ Diese Features wurden entfernt - sie duplizierten andere Tools oder verbrauchten
 
 ## Performance-Vergleich
 
-| Szenario | v3.0 | v4.0 | v5.0 |
-|----------|------|------|------|
-| 10 Dateiänderungen tracken | ~3.000 tok | ~150 tok | ~150 tok |
-| Lange Description (500+ Wörter) | ~1000 tok | ~1000 tok | **~100 tok** |
-| chainguard_mcp.py lesen | 31K tok | 31K tok | **~2K tok** (modular) |
-| Content-Mode (keine Syntax) | N/A | N/A | **0 tok** (skip) |
-| DevOps-Mode (nur Config) | N/A | N/A | **~50 tok** |
-| Disk-Writes bei 10 Tracks | 20 | 20 | **2** |
-| Git Subprocess-Calls | 2/track | 2/track | **0** (cached) |
-| Checklist (10 Items) | 10s (seq) | 10s (seq) | **~1s** (parallel) |
-| HTTP Session Memory | unbegrenzt | unbegrenzt | **50 max** (TTL) |
+| Szenario | v5.0 | v6.0 |
+|----------|------|------|
+| 10 Dateiänderungen tracken | ~150 tok | ~150 tok |
+| `chainguard_projects` (10 items) | ~120 tok | **~70 tok** (TOON) |
+| `chainguard_history` (20 items) | ~300 tok | **~180 tok** (TOON) |
+| Content-Mode (keine Syntax) | 0 tok | 0 tok |
+| Memory RAM-Verbrauch | 1-2GB | **0 MB** (disabled) |
+| Disk-Writes bei 10 Tracks | 2 | 2 |
+| Checklist (10 Items) | ~1s | ~1s |
 
-**v5.0: Task-Mode System + Handler-Registry Pattern + Async Checklist + TTL-Cache.**
+**v6.0: TOON Token-Optimierung + Memory standardmäßig deaktiviert.**
 
 ## Installation
 
