@@ -20,6 +20,11 @@
 - **Automatic Indexing** - Code structure, functions, database schema, architecture patterns
 - **Project Isolation** - Each project has its own isolated memory
 
+### TOON Encoder (v6.0)
+- **Token-Oriented Object Notation** - Compact data format for 30-60% token savings
+- **Optimized for Arrays** - Best for lists of files, tables, history entries
+- **Automatic Formatting** - Tools like `chainguard_projects`, `chainguard_history` use TOON by default
+
 ### Deep Logic Summaries (v5.4)
 - **Code Understanding** - Extracts human-readable summaries of what code actually does
 - **Purpose Inference** - Recognizes patterns from docstrings, comments, and naming conventions

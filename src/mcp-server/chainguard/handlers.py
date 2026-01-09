@@ -28,7 +28,15 @@ from .config import (
     get_mode_context_xml,
     should_validate_syntax,
     XML_RESPONSES_ENABLED,
+    TOON_ENABLED,
+    MEMORY_ENABLED,
     logger
+)
+
+# TOON Encoder (v6.0) - Token-Oriented Object Notation
+from .toon import (
+    encode_toon, toon_array, toon_files, toon_tables,
+    toon_history, toon_projects, toon_criteria, toon_alerts
 )
 
 # XML Response System (v6.0)
@@ -54,7 +62,9 @@ try:
         RelevanceScorer, ContextFormatter, should_index_file
     )
     from .embeddings import KeywordExtractor, detect_task_type
-    MEMORY_AVAILABLE = True
+    # v6.0: Memory can be disabled via config even if dependencies are available
+    # This prevents high RAM usage and potential kernel panics on low-memory systems
+    MEMORY_AVAILABLE = MEMORY_ENABLED
 except ImportError:
     MEMORY_AVAILABLE = False
 
@@ -1183,19 +1193,21 @@ async def handle_projects(args: Dict[str, Any]) -> List[TextContent]:
     """List all tracked projects."""
     projects = await pm.list_all_projects_async()
 
-    # v6.0: XML Response
-    if XML_RESPONSES_ENABLED:
-        if not projects:
-            return _text(xml_info(
-                tool="projects",
-                message="Keine Projekte",
-                data={"count": 0}
-            ))
+    if not projects:
+        return _text("No projects")
 
-        projects_data = [
-            {"name": p["name"], "phase": p["phase"], "last_activity": p["last"]}
-            for p in projects[:10]
-        ]
+    # Build projects data for any format
+    projects_data = [
+        {"id": p["name"][:8], "path": p["name"], "phase": p["phase"], "files": p.get("files", 0)}
+        for p in projects[:10]
+    ]
+
+    # v6.0: TOON Response (30-60% token savings on arrays)
+    if TOON_ENABLED:
+        return _text(toon_projects(projects_data))
+
+    # v6.0: XML Response (disabled by default)
+    if XML_RESPONSES_ENABLED:
         return _text(xml_info(
             tool="projects",
             message=f"{len(projects)} Projekte",
@@ -1203,8 +1215,6 @@ async def handle_projects(args: Dict[str, Any]) -> List[TextContent]:
         ))
 
     # Legacy
-    if not projects:
-        return _text("No projects")
     lines = [f"{p['name']}|{p['phase']}|{p['last']}" for p in projects[:10]]
     return _text("\n".join(lines))
 
@@ -2024,37 +2034,26 @@ async def handle_history(args: Dict[str, Any]) -> List[TextContent]:
     )
 
     if not entries:
-        # v6.0: XML Response
-        if XML_RESPONSES_ENABLED:
-            return _text(xml_info(
-                tool="history",
-                message="Keine History-Eintraege vorhanden",
-                data={"entries": [], "count": 0}
-            ))
         return _text("Keine History-Einträge vorhanden.")
 
-    # Build entries list for XML
+    # Build entries data for any format
     entries_data = []
-    lines = [f"📜 {len(entries)} Einträge" + (" (aktueller Scope)" if scope_only else ""), ""]
-
     for entry in entries[:limit]:
-        # Format: HH:MM action file [validation]
         ts_short = entry.ts[11:16] if len(entry.ts) > 16 else entry.ts[:5]
-        val_icon = "✓" if entry.validation == "PASS" else "✗"
         file_short = Path(entry.file).name if entry.file else "?"
-
-        # For XML
+        status = "ok" if entry.validation == "PASS" else "err"
         entries_data.append({
             "time": ts_short,
-            "action": entry.action,
             "file": file_short,
-            "validation": entry.validation
+            "action": entry.action,
+            "status": status
         })
 
-        # For legacy
-        lines.append(f"{ts_short} {entry.action:6} {file_short:20} {val_icon}")
+    # v6.0: TOON Response (30-60% token savings on arrays)
+    if TOON_ENABLED:
+        return _text(toon_history(entries_data))
 
-    # v6.0: XML Response
+    # v6.0: XML Response (disabled by default)
     if XML_RESPONSES_ENABLED:
         return _text(xml_info(
             tool="history",
@@ -2066,6 +2065,10 @@ async def handle_history(args: Dict[str, Any]) -> List[TextContent]:
             }
         ))
 
+    # Legacy
+    lines = [f"📜 {len(entries)} Einträge" + (" (aktueller Scope)" if scope_only else ""), ""]
+    for e in entries_data:
+        lines.append(f"{e['time']} {e['action']:6} {e['file']:20} {'✓' if e['status'] == 'ok' else '✗'}")
     return _text("\n".join(lines))
 
 

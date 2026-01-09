@@ -30,6 +30,15 @@ VERSION = "6.0.0"
 # XML Responses: Structured XML output (disabled by default - unproven benefit, higher token cost)
 XML_RESPONSES_ENABLED = False
 
+# TOON Responses: Token-Oriented Object Notation for 30-60% token reduction on array outputs
+# Best for: chainguard_context, chainguard_db_schema, chainguard_history, chainguard_projects
+TOON_ENABLED = True
+
+# Long-Term Memory: ChromaDB + sentence-transformers for semantic code search
+# WARNING: Can cause high RAM usage (1-2GB+) and kernel panics on low-memory systems!
+# Set to False to disable even if dependencies are installed
+MEMORY_ENABLED = False
+
 
 # =============================================================================
 # Enums

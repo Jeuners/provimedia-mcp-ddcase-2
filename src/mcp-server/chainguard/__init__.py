@@ -9,10 +9,12 @@ Licensed under the Polyform Noncommercial License 1.0.0
 See LICENSE file in the project root for full license information.
 
 v6.0.0 Changes:
-- XML Response System: Structured XML responses for better Claude comprehension
-- Based on research showing +56% accuracy improvement with XML vs JSON
-- Feature flag XML_RESPONSES_ENABLED for gradual rollout
-- New module: xml_response.py with XMLResponse class and convenience functions
+- TOON Encoder: Token-Oriented Object Notation for 30-60% token reduction
+- Best for array outputs: context, db_schema, history, projects
+- Feature flag TOON_ENABLED (default: true)
+- New module: toon.py with encode_toon, toon_array, toon_object functions
+- XML Response System: Structured XML responses (disabled by default)
+- Feature flag XML_RESPONSES_ENABLED for optional XML output
 
 v5.3.0 Changes:
 - AST Code Analysis: tree-sitter based code structure extraction
@@ -100,7 +102,24 @@ from .config import (
     CONFIG,
     CHAINGUARD_HOME,
     XML_RESPONSES_ENABLED,
+    TOON_ENABLED,
+    MEMORY_ENABLED,
     logger
+)
+
+# TOON Encoder (v6.0) - Token-Oriented Object Notation
+from .toon import (
+    TOONConfig,
+    encode_toon,
+    toon_array,
+    toon_object,
+    toon_files,
+    toon_tables,
+    toon_history,
+    toon_projects,
+    toon_criteria,
+    toon_alerts,
+    compare_formats,
 )
 
 # XML Response System (v6.0)
@@ -270,7 +289,22 @@ __all__ = [
     "CONFIG",
     "CHAINGUARD_HOME",
     "XML_RESPONSES_ENABLED",
+    "TOON_ENABLED",
+    "MEMORY_ENABLED",
     "logger",
+
+    # TOON Encoder (v6.0)
+    "TOONConfig",
+    "encode_toon",
+    "toon_array",
+    "toon_object",
+    "toon_files",
+    "toon_tables",
+    "toon_history",
+    "toon_projects",
+    "toon_criteria",
+    "toon_alerts",
+    "compare_formats",
 
     # XML Response System (v6.0)
     "XMLResponse",
