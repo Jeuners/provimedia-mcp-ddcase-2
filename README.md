@@ -30,6 +30,7 @@
 
 ### Hallucination Prevention (v6.1+)
 - **Symbol Validation** - Detects hallucinated function/method calls with confidence scoring
+- **PHP Builtins Database** - 11,000+ PHP functions/classes/methods from JetBrains phpstorm-stubs (v6.3.1)
 - **Slopsquatting Detection** - Catches typosquatted package names (e.g., `requets` instead of `requests`)
 - **7-Language Support** - PHP, JavaScript, TypeScript, Python, C#, Go, Rust
 - **Package Registry Validation** - Checks imports against composer.json, package.json, requirements.txt
@@ -293,6 +294,14 @@ See the [LICENSE](LICENSE) file for full details.
 Created and maintained by **[Provimedia GmbH](https://provimedia.de)**
 
 ## Changelog
+
+### v6.3.1
+- **PHP Builtins Database** - 11,000+ PHP functions/classes/methods from JetBrains phpstorm-stubs
+  - Dramatically reduces false positives in symbol validation (from 170+ to near zero)
+  - Includes: Core functions (5,028), classes (1,035), methods (10,039)
+  - Lazy-loaded on first PHP validation for zero startup cost
+  - Generator script to update from latest phpstorm-stubs
+- New `generate_php_builtins.py` script for updating the database
 
 ### v6.3.0
 - **PHPStan Integration** - Static analysis for PHP files catches runtime errors BEFORE execution
