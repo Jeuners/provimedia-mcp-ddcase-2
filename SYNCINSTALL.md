@@ -167,7 +167,7 @@ cp -r src/mcp-server/chainguard ~/.chainguard/
 
 ---
 
-## Modulstruktur (v6.4.1)
+## Modulstruktur (v6.4.2)
 
 Das Chainguard MCP Server Package besteht aus folgenden Modulen:
 
