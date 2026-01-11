@@ -101,6 +101,9 @@ class ProjectState:
     sources: List[Dict[str, Any]] = field(default_factory=list)  # [{url, title, relevance}]
     facts: List[Dict[str, Any]] = field(default_factory=list)  # [{fact, source, confidence}]
 
+    # Symbol Validation Warnings (v6.4.1) - collected during session, shown at finish
+    symbol_warnings: List[str] = field(default_factory=list)
+
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2, default=str, ensure_ascii=False)
 
@@ -153,7 +156,9 @@ class ProjectState:
             "command_history": [],
             "checkpoints": [],
             "sources": [],
-            "facts": []
+            "facts": [],
+            # Symbol Validation (v6.4.1)
+            "symbol_warnings": []
         }
         for key, value in defaults.items():
             data.setdefault(key, value)

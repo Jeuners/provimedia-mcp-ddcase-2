@@ -157,6 +157,7 @@ from .handlers import HandlerRegistry
 from .test_runner import TestRunner, TestConfig, TestResult
 from .history import HistoryManager, HistoryEntry, ErrorEntry, format_auto_suggest
 from .db_inspector import DBInspector, DBConfig, get_inspector, clear_inspector
+from .db_credentials import CredentialStore, get_credential_store
 
 # Hallucination Prevention (v6.1)
 from .symbol_validator import (

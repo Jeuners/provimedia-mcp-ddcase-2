@@ -534,6 +534,12 @@ async def handle_track(args: Dict[str, Any]) -> List[TextContent]:
                             if len(high_conf) > 3:
                                 messages.append(f"   ... und {len(high_conf) - 3} weitere")
                             messages.append("   → Prüfe ob diese Funktionen existieren")
+
+                            # v6.4.1: Collect warnings for finish summary
+                            for issue in high_conf:
+                                warning = f"{Path(file).name}:{issue.line} → {issue.name}() [{issue.confidence:.0%}]"
+                                if warning not in state.symbol_warnings:
+                                    state.symbol_warnings.append(warning)
         except Exception as e:
             logger.debug(f"Symbol validation skipped: {e}")
 
@@ -1667,23 +1673,36 @@ async def handle_finish(args: Dict[str, Any]) -> List[TextContent]:
             if MEMORY_AVAILABLE:
                 await _consolidate_session_learnings(state, scope_desc)
 
+            # v6.4.1: Include symbol warnings in response
+            if state.symbol_warnings:
+                data["symbol_warnings"] = state.symbol_warnings[:10]  # Max 10
+                data["symbol_warnings_count"] = len(state.symbol_warnings)
+
             state.changed_files = []
+            symbol_warnings_copy = state.symbol_warnings.copy()  # Keep for message
+            state.symbol_warnings = []  # Clear after finish
 
             if force and not completion["complete"]:
                 state.add_action("FINISH: FORCED")
                 await pm.save_async(state, immediate=True)
                 data["forced"] = True
+                msg = "Task abgeschlossen (erzwungen)"
+                if symbol_warnings_copy:
+                    msg += f" - ACHTUNG: {len(symbol_warnings_copy)} Symbol-Warnungen!"
                 return _text(xml_warning(
                     tool="finish",
-                    message="Task abgeschlossen (erzwungen)",
+                    message=msg,
                     data=data
                 ))
             else:
                 state.add_action("FINISH: CONFIRMED")
                 await pm.save_async(state, immediate=True)
+                msg = "Task erfolgreich abgeschlossen"
+                if symbol_warnings_copy:
+                    msg += f" - ACHTUNG: {len(symbol_warnings_copy)} Symbol-Warnungen prüfen!"
                 return _text(xml_success(
                     tool="finish",
-                    message="Task erfolgreich abgeschlossen",
+                    message=msg,
                     data=data
                 ))
 
@@ -1755,6 +1774,19 @@ async def handle_finish(args: Dict[str, Any]) -> List[TextContent]:
             await _consolidate_session_learnings(state, scope_desc)
 
         state.changed_files = []
+
+        # v6.4.1: Show symbol warnings before completing
+        symbol_warnings_copy = state.symbol_warnings.copy()
+        state.symbol_warnings = []  # Clear after finish
+
+        if symbol_warnings_copy:
+            lines.append("")
+            lines.append(f"⚠️ **{len(symbol_warnings_copy)} Symbol-Warnungen gesammelt:**")
+            for warning in symbol_warnings_copy[:10]:  # Max 10
+                lines.append(f"   • {warning}")
+            if len(symbol_warnings_copy) > 10:
+                lines.append(f"   ... und {len(symbol_warnings_copy) - 10} weitere")
+            lines.append("   → Bitte prüfen ob diese Funktionen wirklich existieren!")
 
         if force and not completion["complete"]:
             state.add_action("FINISH: FORCED")
@@ -2213,27 +2245,62 @@ async def handle_learn(args: Dict[str, Any]) -> List[TextContent]:
 
 @handler.register("chainguard_db_connect")
 async def handle_db_connect(args: Dict[str, Any]) -> List[TextContent]:
-    """Connect to database for schema inspection."""
+    """Connect to database for schema inspection.
+
+    v6.4: Supports persistent credentials per project.
+    - If no credentials given, tries to load saved credentials
+    - On success, saves credentials for next session
+    - On failure with saved credentials, deletes them (may be outdated)
+    """
+    from .db_credentials import get_credential_store
+
     working_dir = args.get("working_dir")
     state = await pm.get_async(working_dir)
+    remember = args.get("remember", True)  # Default: save credentials
 
-    config = DBConfig(
-        host=args.get("host", "localhost"),
-        port=args.get("port", 3306),
-        user=args.get("user", ""),
-        password=args.get("password", ""),
-        database=args.get("database", ""),
-        db_type=args.get("db_type", "mysql")
-    )
+    # Check if new credentials provided
+    user = args.get("user", "")
+    password = args.get("password", "")
+    database = args.get("database", "")
 
-    if not config.user or not config.database:
-        if XML_RESPONSES_ENABLED:
-            return _text(xml_error(
-                tool="db_connect",
-                message="user und database sind erforderlich",
-                data={"required_params": ["user", "database"]}
-            ))
-        return _text("⚠ user und database sind erforderlich")
+    used_saved = False
+    config = None
+
+    if not user and not database:
+        # Try to load saved credentials
+        store = get_credential_store()
+        saved = store.load(working_dir)
+
+        if saved:
+            config = saved
+            used_saved = True
+        else:
+            if XML_RESPONSES_ENABLED:
+                return _text(xml_error(
+                    tool="db_connect",
+                    message="Keine Credentials. user + database angeben.",
+                    data={"hint": "Gib user, password, database an. Nach Erfolg werden sie gespeichert."}
+                ))
+            return _text("⚠ Keine Credentials. user + database angeben.")
+    else:
+        # Use provided credentials
+        config = DBConfig(
+            host=args.get("host", "localhost"),
+            port=args.get("port", 3306),
+            user=user,
+            password=password,
+            database=database,
+            db_type=args.get("db_type", "mysql")
+        )
+
+        if not config.user or not config.database:
+            if XML_RESPONSES_ENABLED:
+                return _text(xml_error(
+                    tool="db_connect",
+                    message="user und database sind erforderlich",
+                    data={"required_params": ["user", "database"]}
+                ))
+            return _text("⚠ user und database sind erforderlich")
 
     inspector = get_inspector(state.project_id)
     result = await inspector.connect(config)
@@ -2250,32 +2317,60 @@ async def handle_db_connect(args: Dict[str, Any]) -> List[TextContent]:
         state.add_action(f"DB: {config.database}")
         await pm.save_async(state)
 
+        # Save credentials after successful connection (if new credentials provided)
+        saved_msg = ""
+        if remember and not used_saved:
+            store = get_credential_store()
+            if store.save(working_dir, config):
+                saved_msg = " (Credentials gespeichert)"
+
         version = result.get("version", "")
+
+        # Build response message
+        if used_saved:
+            base_msg = f"Verbunden mit gespeicherten Credentials ({config.database})"
+        else:
+            base_msg = f"Verbunden mit {config.database}"
 
         # v6.0: XML Response
         if XML_RESPONSES_ENABLED:
             return _text(xml_success(
                 tool="db_connect",
-                message=f"Verbunden mit {config.database}",
+                message=base_msg + saved_msg,
                 data={
                     "database": config.database,
                     "db_type": config.db_type,
                     "version": version,
-                    "host": config.host
+                    "host": config.host,
+                    "used_saved_credentials": used_saved,
+                    "credentials_saved": bool(saved_msg)
                 }
             ))
 
-        return _text(f"✓ Connected to {config.database} ({config.db_type} {version})")
+        return _text(f"✓ {base_msg} ({config.db_type} {version}){saved_msg}")
+
+    # Connection failed
+    # If we used saved credentials, they might be outdated - delete them
+    if used_saved:
+        store = get_credential_store()
+        store.delete(working_dir)
 
     # v6.0: XML Response
     if XML_RESPONSES_ENABLED:
         return _text(xml_error(
             tool="db_connect",
             message="Verbindung fehlgeschlagen",
-            data={"error": result.get("message", "Unknown error")}
+            data={
+                "error": result.get("message", "Unknown error"),
+                "used_saved_credentials": used_saved,
+                "saved_credentials_deleted": used_saved
+            }
         ))
 
-    return _text(f"✗ Connection failed: {result.get('message', 'Unknown error')}")
+    error_msg = f"✗ Connection failed: {result.get('message', 'Unknown error')}"
+    if used_saved:
+        error_msg += " (gespeicherte Credentials gelöscht)"
+    return _text(error_msg)
 
 
 @handler.register("chainguard_db_schema")
@@ -2405,6 +2500,38 @@ async def handle_db_disconnect(args: Dict[str, Any]) -> List[TextContent]:
         ))
 
     return _text("✓ Datenbankverbindung getrennt, Cache gelöscht")
+
+
+@handler.register("chainguard_db_forget")
+async def handle_db_forget(args: Dict[str, Any]) -> List[TextContent]:
+    """Delete saved DB credentials for this project (v6.4)."""
+    from .db_credentials import get_credential_store
+
+    working_dir = args.get("working_dir")
+
+    store = get_credential_store()
+    info = store.get_info(working_dir)
+
+    if store.delete(working_dir):
+        db_name = info.get('database', 'unknown') if info else 'unknown'
+
+        if XML_RESPONSES_ENABLED:
+            return _text(xml_success(
+                tool="db_forget",
+                message=f"Credentials für {db_name} gelöscht",
+                data={"deleted": True, "database": db_name}
+            ))
+
+        return _text(f"✓ DB-Credentials gelöscht ({db_name})")
+    else:
+        if XML_RESPONSES_ENABLED:
+            return _text(xml_info(
+                tool="db_forget",
+                message="Keine gespeicherten Credentials gefunden",
+                data={"deleted": False}
+            ))
+
+        return _text("ℹ Keine gespeicherten Credentials für dieses Projekt")
 
 
 # =============================================================================

@@ -386,22 +386,23 @@ The mode determines which features are active (syntax validation, HTTP tests, et
             }
         ),
 
-        # Database Inspector (v4.12)
+        # Database Inspector (v4.12, v6.4: persistent credentials)
         Tool(
             name="chainguard_db_connect",
-            description="Connect to database for live schema inspection. Credentials stored in memory only. Prevents LLM from guessing field names.",
+            description="Connect to database. v6.4: Credentials are saved (obfuscated) per project after successful connection. Call without params to use saved credentials.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "working_dir": {"type": "string"},
                     "host": {"type": "string", "description": "Database host", "default": "localhost"},
                     "port": {"type": "integer", "description": "Database port", "default": 3306},
-                    "user": {"type": "string", "description": "Database user"},
-                    "password": {"type": "string", "description": "Database password"},
-                    "database": {"type": "string", "description": "Database name"},
-                    "db_type": {"type": "string", "enum": ["mysql", "postgres", "sqlite"], "default": "mysql"}
+                    "user": {"type": "string", "description": "Database user (optional if saved)"},
+                    "password": {"type": "string", "description": "Database password (optional if saved)"},
+                    "database": {"type": "string", "description": "Database name (optional if saved)"},
+                    "db_type": {"type": "string", "enum": ["mysql", "postgres", "sqlite"], "default": "mysql"},
+                    "remember": {"type": "boolean", "description": "Save credentials for next session", "default": True}
                 },
-                "required": ["user", "password", "database"]
+                "required": []
             }
         ),
 
@@ -435,6 +436,18 @@ The mode determines which features are active (syntax validation, HTTP tests, et
         Tool(
             name="chainguard_db_disconnect",
             description="Disconnect from database and clear schema cache.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "working_dir": {"type": "string"}
+                },
+                "required": []
+            }
+        ),
+
+        Tool(
+            name="chainguard_db_forget",
+            description="Delete saved DB credentials for this project. Use when password changed or to remove stored credentials.",
             inputSchema={
                 "type": "object",
                 "properties": {

@@ -248,6 +248,22 @@ class TestPHPPatterns:
         """Test isset is recognized as builtin."""
         assert is_builtin("isset", Language.PHP)
 
+    def test_php_builtin_foreach(self):
+        """Test foreach is recognized as builtin (language construct)."""
+        assert is_builtin("foreach", Language.PHP)
+
+    def test_php_builtin_while(self):
+        """Test while is recognized as builtin (language construct)."""
+        assert is_builtin("while", Language.PHP)
+
+    def test_php_builtin_if(self):
+        """Test if is recognized as builtin (language construct)."""
+        assert is_builtin("if", Language.PHP)
+
+    def test_php_builtin_match(self):
+        """Test match is recognized as builtin (PHP 8.0+ language construct)."""
+        assert is_builtin("match", Language.PHP)
+
     def test_php_not_builtin(self):
         """Test custom function is not recognized as builtin."""
         assert not is_builtin("myCustomFunction", Language.PHP)

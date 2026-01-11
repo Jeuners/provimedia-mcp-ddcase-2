@@ -262,7 +262,8 @@ python3 -m pytest tests/ -v
 | TOON Encoder | 63 |
 | Hallucination Prevention | 71 |
 | Symbol Validation | 47 |
-| **Total** | **1111+** |
+| DB Credentials | 30 |
+| **Total** | **1145+** |
 
 ## Contributing
 
@@ -304,6 +305,23 @@ The PHP builtins database (`data/php_builtins.json`) is generated from phpstorm-
 Created and maintained by **[Provimedia GmbH](https://provimedia.de)**
 
 ## Changelog
+
+### v6.4.1
+- **Symbol Warning Aggregation** - Hallucination warnings are now collected during session
+  - Warnings are stored in `state.symbol_warnings` instead of being shown only once
+  - All collected warnings are displayed at `chainguard_finish()` - prevents them from being lost
+  - Useful for long sessions with 40+ tasks where warnings would otherwise be ignored
+- Better visibility for potential hallucinated function calls
+
+### v6.4.0
+- **Persistent DB Credentials** - Database credentials saved per project (obfuscated)
+  - Call `chainguard_db_connect()` without parameters to use saved credentials
+  - Credentials are XOR + Base64 obfuscated (machine-specific key)
+  - Auto-saved after successful connection, auto-deleted on failure
+  - New `chainguard_db_forget` tool to delete saved credentials
+  - New `db_credentials.py` module with `CredentialStore` class
+  - 30 new tests for credential handling
+- New `remember` parameter for `chainguard_db_connect` (default: True)
 
 ### v6.3.1
 - **PHP Builtins Database** - 11,000+ PHP functions/classes/methods from JetBrains phpstorm-stubs

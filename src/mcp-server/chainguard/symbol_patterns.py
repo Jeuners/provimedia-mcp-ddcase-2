@@ -292,9 +292,12 @@ PROPERTY_PATTERNS: Dict[Language, List[str]] = {
 
 BUILTINS: Dict[Language, Set[str]] = {
     Language.PHP: {
-        # Language constructs
+        # Language constructs (these look like function calls but are keywords)
         'isset', 'empty', 'array', 'list', 'echo', 'print', 'die', 'exit',
         'include', 'include_once', 'require', 'require_once', 'eval',
+        'foreach', 'while', 'for', 'if', 'elseif', 'else', 'switch', 'case',
+        'catch', 'match', 'fn', 'unset', 'declare', 'enddeclare',
+        'endfor', 'endforeach', 'endif', 'endswitch', 'endwhile',
         # Type functions
         'is_array', 'is_string', 'is_null', 'is_numeric', 'is_object', 'is_bool',
         'is_int', 'is_float', 'is_callable', 'is_resource', 'gettype', 'settype',
