@@ -1,3 +1,56 @@
+Sicherheitsbericht: Analyse potenzieller Schwachstellen (Chainguard MCP)
+Der Chainguard MCP-Server erweitert Claude Code um Funktionen wie Task-Tracking, semantisches Gedächtnis und Datenbank-Inspektion
+. Trotz fortschrittlicher Funktionen zur Halluzinationsprävention ergeben sich aus der Architektur und den dokumentierten Features folgende potenzielle Angriffspunkte:
+1. Speicherung von Datenbank-Anmeldeinformationen
+In der Version 6.4.0 wurde eine Funktion eingeführt, um Datenbank-Zugangsdaten projektbezogen zu speichern
+.
+• Schwachstelle: Die Zugangsdaten werden mittels XOR + Base64 verschleiert („obfuscated“)
+.
+• Risiko: (Information aus externem Wissen): Obfuskation ist keine echte Verschlüsselung. Ein Angreifer, der Zugriff auf das lokale Dateisystem (Verzeichnis ~/.chainguard/) erhält, könnte den maschinenspezifischen Schlüssel rekonstruieren und die Klartext-Passwörter extrahieren
+.
+• Empfehlung: Einsatz eines sicheren Keychains oder Tresor-Systems des Betriebssystems anstelle von XOR-Verschleierung.
+2. Lokale Datenspeicherung und Privatsphäre
+Das System nutzt ChromaDB für ein lokales Vektorgedächtnis, das Code-Strukturen, Funktionen und Architekturmuster indiziert
+.
+• Schwachstelle: Alle Informationen werden zu 100 % offline in ~/.chainguard/memory/ gespeichert
+.
+• Risiko: Sollte der Entwickler-Rechner in einer gemeinsam genutzten Umgebung stehen oder kompromittiert werden, liegen dort hochempfindliche semantische Zusammenfassungen des gesamten Quellcodes (Deep Logic Summaries) vor
+.
+• Empfehlung: Sicherstellen, dass das Verzeichnis ~/.chainguard/ nur für den aktuellen Benutzer lesbar ist (Dateiberechtigungen).
+3. Angriffspunkt: HTTP-Endpoint-Testing
+Die Tools chainguard_test_endpoint und chainguard_login ermöglichen das Testen von Endpunkten und das Speichern von Sessions
+.
+• Schwachstelle: Automatische Authentifizierungserkennung und Session-Speicherung
+.
+• Risiko: Wenn ein LLM durch eine bösartige Eingabe (Prompt Injection) dazu gebracht wird, sensible Session-Daten an einen externen, vom Angreifer kontrollierten Server zu senden, könnten Zugangsdaten abfließen.
+• Empfehlung: Implementierung einer Whitelist für erlaubte Test-URLs oder eine explizite Bestätigung durch den Nutzer vor dem Senden von Anfragen an unbekannte Domains.
+4. Supply-Chain-Risiko bei der Installation
+Die empfohlene Installationsmethode ist ein direktes Ausführen eines Shell-Skripts via curl
+.
+• Schwachstelle: curl -fsSL https://raw.githubusercontent.com/.../install.sh | bash
+.
+• Risiko: (Information aus externem Wissen): Dies ist ein klassischer Angriffsvektor. Falls das GitHub-Repository oder der Übertragungsweg kompromittiert wird, kann beliebiger Schadcode mit Benutzerrechten ausgeführt werden.
+• Empfehlung: Bereitstellung von signierten Paketen oder die manuelle Prüfung des Skripts vor der Ausführung betonen.
+5. Informationsabfluss durch Datenbank-Schema-Inspektion
+Die Tools chainguard_db_schema und chainguard_db_table liefern detaillierte Metadaten über die Datenbankstruktur an die KI
+.
+• Schwachstelle: Bereitstellung von Feldnamen und Tabellenstrukturen zur Vermeidung von Halluzinationen
+.
+• Risiko: Ein kompromittiertes oder manipuliertes LLM könnte diese Strukturinformationen nutzen, um gezielte SQL-Injection-Angriffe vorzubereiten, falls die Anwendung selbst Sicherheitslücken aufweist.
+• Empfehlung: Beschränkung des Datenbank-Nutzers auf reine Leserechte für das Schema (Read-only) und Deaktivierung der Funktion in Produktionsumgebungen.
+6. Umgehung der Halluzinationssprävention
+Obwohl Chainguard über Mechanismen verfügt, um halluzinierte Funktionsaufrufe zu blockieren (STRICT-Modus), kann dies durch den Parameter force=True bei chainguard_finish() überschrieben werden
+.
+• Schwachstelle: Manuelle Übersteuerung von Sicherheitswarnungen
+.
+• Risiko: Ein Entwickler könnte unter Zeitdruck oder durch geschicktes Social Engineering der KI dazu verleitet werden, potenziell schädlichen oder fehlerhaften Code trotz Warnungen in die Codebase zu übernehmen.
+• Empfehlung: Protokollierung von erzwungenen Abschlüssen (force=True) in den chainguard_history-Logs zur späteren Revision
+.
+Zusammenfassend lässt sich sagen: Die größte technische Schwachstelle liegt in der Verschleierung statt Verschlüsselung der Datenbank-Credentials
+. Die anderen Punkte betreffen primär die sichere Handhabung des MCP-Servers durch den menschlichen Entwickler.
+Um es mit einem Bild zu vergleichen: Die XOR-Verschleierung der Passwörter ist wie ein Schlüssel, den man unter die Fußmatte legt – sie schützt vor neugierigen Blicken von weitem, aber jeder, der direkt vor der Tür steht und sucht, wird ihn finden.
+
+--- orginal
 # Chainguard - MCP Server for Claude Code
 
 [![License: Polyform Noncommercial](https://img.shields.io/badge/License-Polyform%20NC-blue.svg)](https://polyformproject.org/licenses/noncommercial/1.0.0)
